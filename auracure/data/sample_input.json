@@ -1,0 +1,24 @@
+{
+  "_meta": {
+    "description": "Demo patient payload for quick testing of AuraEcho+",
+    "version": "1.0.0",
+    "note": "All values are fictional and for demonstration purposes only."
+  },
+  "patient": {
+    "age": 54,
+    "sex": 1,
+    "cp": 2,
+    "trestbps": 130,
+    "chol": 245,
+    "fbs": 0,
+    "restecg": 1,
+    "thalach": 155,
+    "exang": 0,
+    "oldpeak": 1.4,
+    "slope": 2,
+    "ca": 1,
+    "thal": 2
+  },
+  "expected_risk": "MEDIUM",
+  "notes": "Middle-aged male with moderate cholesterol and non-anginal chest pain. Suitable for testing the MEDIUM risk band."
+}
