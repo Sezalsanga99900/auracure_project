@@ -1,0 +1,88 @@
+# ══════════════════════════════════════════════════════════════════
+# AuraEcho+ — .gitignore
+# ══════════════════════════════════════════════════════════════════
+
+# ── SECRET FILES — NEVER COMMIT ──────────────────────────────────
+.env
+.env.local
+.env.production
+.env.staging
+data/firebase_credentials.json
+*_credentials.json
+*_service_account.json
+*.pem
+*.key
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# ── Virtual Environments ─────────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+.env/
+
+# ── Testing & Coverage ───────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+*.coveragerc
+
+# ── Databases (local data — not for version control) ─────────────
+database/*.db
+database/*.sqlite
+database/*.sqlite3
+
+# ── ML Models & Scalers (regenerated from data) ──────────────────
+data/models/*.pkl
+data/models/*.joblib
+data/models/*.h5
+
+# ── Export files ─────────────────────────────────────────────────
+data/exports/
+*.csv.export
+
+# ── Streamlit ────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── IDE & Editor ─────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Jupyter ──────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── OS ───────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Desktop.ini
+$RECYCLE.BIN/

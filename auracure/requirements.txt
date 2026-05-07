@@ -1,6 +1,56 @@
-numpy
-pandas
-scikit-learn
-firebase-admin
-groq
-openai
+# numpy
+# pandas
+# scikit-learn
+# firebase-admin
+# groq
+# openai
+
+# ══════════════════════════════════════════════════════════════
+# AuraEcho+ — Requirements
+# Install: pip install -r requirements.txt
+# Python:  3.10 | 3.11 | 3.12
+# ══════════════════════════════════════════════════════════════
+
+# ── Web Framework ──────────────────────────────────────────────
+streamlit>=1.35.0,<2.0.0          # UI framework — core dependency
+
+# ── Data Science & ML ──────────────────────────────────────────
+numpy>=1.26.0,<2.0.0              # numerical arrays
+pandas>=2.1.0,<3.0.0              # dataframes + CSV handling
+scikit-learn>=1.4.0,<2.0.0        # RandomForest, KNN, MinMaxScaler
+
+# ── Visualisation ──────────────────────────────────────────────
+plotly>=5.18.0,<6.0.0             # interactive charts for dashboard
+
+# ── AI — Online Backends ───────────────────────────────────────
+groq>=0.9.0                       # Groq API (ultra-fast Llama3)
+openai>=1.30.0                    # OpenAI GPT-4o fallback
+
+# ── AI — Offline (Ollama talks over HTTP — no Python SDK needed)
+requests>=2.31.0                  # HTTP client for Ollama API calls
+
+# ── Database ───────────────────────────────────────────────────
+# sqlite3 is in Python stdlib — no install needed
+firebase-admin>=6.4.0             # Firebase Firestore cloud DB
+
+# ── Authentication ─────────────────────────────────────────────
+bcrypt>=4.1.0                     # password hashing (production-grade)
+
+# ── Environment & Config ───────────────────────────────────────
+python-dotenv>=1.0.0              # loads .env file into os.environ
+
+# ── Utilities ──────────────────────────────────────────────────
+python-dateutil>=2.8.2            # robust date parsing
+pytz>=2024.1                      # timezone handling
+
+# ── Development & Testing ──────────────────────────────────────
+pytest>=8.0.0                     # test runner
+pytest-cov>=4.1.0                 # coverage reports
+
+# ── Optional: PDF report generation ───────────────────────────
+# Uncomment if you want PDF export of patient reports:
+# reportlab>=4.1.0
+
+# ── Optional: Excel export ─────────────────────────────────────
+# Uncomment for Excel export in analytics dashboard:
+# openpyxl>=3.1.0
