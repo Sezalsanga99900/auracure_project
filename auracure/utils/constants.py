@@ -380,6 +380,7 @@ ROLES = {
 ROLE_DOCTOR = ROLES["DOCTOR"]
 ROLE_NURSE  = ROLES["NURSE"]
 ROLE_ADMIN  = ROLES["ADMIN"]
+ROLE_VIEWER = ROLES["VIEWER"] 
 
 # -----------------------------------------------------------------------------
 # ROLE PERMISSIONS MAP  →  services/auth_service.py + ui/role_dashboard.py
