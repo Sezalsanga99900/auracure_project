@@ -1,352 +1,510 @@
-"""
-ui/sidebar.py
-─────────────────────────────────────────────────────────────────
-AuraCure — Patient Input Sidebar
-Purpose : Renders the left-side panel where the doctor fills in
-          all patient details. Also shows the Online / Offline
-          mode badge at the top so the doctor always knows which
-          mode the system is operating in.
-
-Dependencies used here
-  • streamlit          — draws every widget (sliders, inputs, etc.)
-  • utils/validators   — checks inputs before submission
-  • core/mode_detector — tells us if internet is available
-─────────────────────────────────────────────────────────────────
-"""
+# =============================================================================
+# ui/sidebar.py
+# AuraEcho+ — Streamlit Sidebar Component
+#
+# Responsibility:
+#     Render the sidebar with patient input form, mode badge, sync status,
+#     user session info, and navigation controls.
+#
+# Sections:
+#     1. App Header & Mode Badge
+#     2. User Session Info
+#     3. Patient Input Form
+#     4. Sync Status & Controls
+#     5. Navigation
+#     6. System Status (collapsible)
+#
+# Public API:
+#     render_sidebar() → dict (sidebar state)
+# =============================================================================
 
 import streamlit as st
+from typing import Any, Dict, Optional
+
+from utils.constants import (
+    APP_NAME,
+    APP_VERSION,
+    PAGE_ICON,
+    MODE_ONLINE,
+    MODE_OFFLINE,
+    UI_PRIMARY_COLOR,
+    UI_SUCCESS_COLOR,
+    UI_WARNING_COLOR,
+    UI_DANGER_COLOR,
+    FEATURE_COLUMNS,
+    FEATURE_LABELS,
+    FEATURE_RANGES,
+    FEATURE_VALID_VALUES,
+    CATEGORICAL_FEATURES,
+    NUMERICAL_FEATURES,
+    CHEST_PAIN_LABELS,
+    THAL_LABELS,
+    SLOPE_LABELS,
+    RESTECG_LABELS,
+)
+from utils.helpers import (
+    get_logger,
+    format_mode,
+    load_sample_input,
+    now_str,
+)
+from core.mode_detector import (
+    is_online,
+    get_mode_label,
+    get_connection_info,
+    invalidate_cache,
+)
+from services.sync_service import (
+    get_sync_status,
+    force_sync,
+    is_sync_active,
+    start_auto_sync,
+    stop_auto_sync,
+)
+from services.auth_service import (
+    get_session_user,
+    logout,
+    user_has_permission,
+)
+
+logger = get_logger(__name__)
 
 
-# ── Inline CSS injected once ──────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# CSS Styles
+# ─────────────────────────────────────────────
 
 SIDEBAR_CSS = """
 <style>
-/* ── Google Font ── */
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
-
-/* ── Global sidebar reset ── */
-section[data-testid="stSidebar"] {
-    background: #F0F4FF !important;
-    border-right: 1.5px solid #D6E0FF;
-}
-section[data-testid="stSidebar"] * {
-    font-family: 'DM Sans', sans-serif !important;
-}
-
-/* ── Mode badge ── */
-.mode-badge {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 16px;
-    border-radius: 10px;
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    margin-bottom: 20px;
-}
-.mode-badge.online  { background:#E6F9F0; color:#0A7A46; border:1.5px solid #A8EDCB; }
-.mode-badge.offline { background:#FFF2F2; color:#B91C1C; border:1.5px solid #FECACA; }
-.mode-dot {
-    width: 10px; height: 10px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    animation: pulse 2s ease-in-out infinite;
-}
-.mode-badge.online  .mode-dot { background:#22C55E; box-shadow:0 0 0 3px #BBF7D0; }
-.mode-badge.offline .mode-dot { background:#EF4444; box-shadow:0 0 0 3px #FECACA; animation:none; }
-@keyframes pulse {
-    0%,100% { box-shadow:0 0 0 3px #BBF7D0; }
-    50%      { box-shadow:0 0 0 6px #DCFCE7; }
-}
-
-/* ── Section headers ── */
-.form-section-title {
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.10em;
-    text-transform: uppercase;
-    color: #6B7AB8;
-    margin: 18px 0 8px 0;
-    padding-bottom: 6px;
-    border-bottom: 1px solid #D6E0FF;
-}
-
-/* ── Logo area ── */
-.sidebar-logo {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 22px;
-    padding-bottom: 16px;
-    border-bottom: 1.5px solid #D6E0FF;
-}
-.logo-icon {
-    width: 36px; height: 36px;
-    background: linear-gradient(135deg, #3B5BDB, #228BE6);
-    border-radius: 10px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 18px;
-}
-.logo-text { font-size: 18px; font-weight: 700; color: #1E3A8A; letter-spacing:-0.02em; }
-.logo-sub  { font-size: 10px; color: #6B7AB8; font-weight:500; letter-spacing:0.05em; }
-
-/* ── Submit button ── */
-div[data-testid="stButton"] > button {
-    background: linear-gradient(135deg, #3B5BDB 0%, #228BE6 100%) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 10px !important;
-    padding: 12px 0 !important;
-    font-family: 'DM Sans', sans-serif !important;
-    font-size: 15px !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.02em !important;
-    width: 100% !important;
-    margin-top: 10px !important;
-    transition: all 0.2s ease !important;
-    box-shadow: 0 4px 15px rgba(59,91,219,0.35) !important;
-}
-div[data-testid="stButton"] > button:hover {
-    transform: translateY(-1px) !important;
-    box-shadow: 0 6px 20px rgba(59,91,219,0.45) !important;
-}
-
-/* ── Streamlit widget tweaks ── */
-div[data-testid="stSelectbox"] label,
-div[data-testid="stSlider"] label,
-div[data-testid="stTextInput"] label,
-div[data-testid="stNumberInput"] label,
-div[data-testid="stMultiSelect"] label {
-    font-size: 12px !important;
-    font-weight: 600 !important;
-    color: #374151 !important;
-    letter-spacing: 0.01em !important;
-}
-div[data-testid="stSelectbox"] > div > div,
-div[data-testid="stTextInput"] > div > div > input {
-    border-radius: 8px !important;
-    border: 1.5px solid #C7D2FE !important;
-    background: #FFFFFF !important;
-    font-size: 13px !important;
-}
-div[data-testid="stSelectbox"] > div > div:focus-within,
-div[data-testid="stTextInput"] > div > div:focus-within {
-    border-color: #3B5BDB !important;
-    box-shadow: 0 0 0 3px rgba(59,91,219,0.12) !important;
-}
-
-/* ── Disclaimer box ── */
-.disclaimer-box {
-    background: #FFF7ED;
-    border: 1px solid #FED7AA;
-    border-left: 3px solid #F97316;
-    border-radius: 8px;
-    padding: 10px 12px;
-    font-size: 11px;
-    color: #9A3412;
-    line-height: 1.5;
-    margin-top: 16px;
-}
+    /* Sidebar header */
+    .sidebar-header {
+        font-size: 1.2rem;
+        font-weight: 600;
+        color: #1a1a2e;
+        margin-bottom: 0.5rem;
+    }
+    
+    /* Mode badge */
+    .mode-badge {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 500;
+        margin-bottom: 1rem;
+    }
+    .mode-online {
+        background-color: #d4edda;
+        color: #155724;
+    }
+    .mode-offline {
+        background-color: #fff3cd;
+        color: #856404;
+    }
+    
+    /* Section divider */
+    .sidebar-divider {
+        border-top: 1px solid #e0e0e0;
+        margin: 1rem 0;
+    }
+    
+    /* Status indicator */
+    .status-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-right: 0.5rem;
+    }
+    .status-ok { background-color: #2ecc71; }
+    .status-warn { background-color: #f39c12; }
+    .status-error { background-color: #e74c3c; }
+    
+    /* Sync button */
+    .sync-button {
+        width: 100%;
+        padding: 0.5rem;
+        border-radius: 6px;
+        font-size: 0.85rem;
+    }
 </style>
 """
 
 
-# ── Mode badge HTML builder ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Helper functions
+# ─────────────────────────────────────────────
 
-def _build_mode_badge(is_online: bool) -> str:
-    """Return the HTML string for the online / offline badge."""
-    if is_online:
-        return """
-        <div class="mode-badge online">
-            <div class="mode-dot"></div>
-            <span>🟢 Online Mode — Advanced AI Active</span>
-        </div>"""
-    return """
-    <div class="mode-badge offline">
-        <div class="mode-dot"></div>
-        <span>🔴 Offline Mode — Local AI Active</span>
-    </div>"""
-
-
-# ── Symptom options ───────────────────────────────────────────────────────────
-
-SYMPTOM_OPTIONS = [
-    "Chest pain or tightness",
-    "Shortness of breath",
-    "Palpitations / irregular heartbeat",
-    "Dizziness or lightheadedness",
-    "Fatigue or extreme tiredness",
-    "Swelling in legs or ankles",
-    "Nausea or cold sweats",
-    "Pain radiating to arm or jaw",
-    "Fainting (syncope)",
-    "No symptoms (routine check)",
-]
-
-GENDER_OPTIONS   = ["Male", "Female", "Other"]
-SMOKING_OPTIONS  = ["Never", "Former smoker", "Current smoker"]
-DIABETES_OPTIONS = ["No", "Type 1", "Type 2", "Pre-diabetic"]
+def _render_mode_badge() -> None:
+    """Render the online/offline mode badge."""
+    mode_info = format_mode(get_connection_info().get("mode", MODE_OFFLINE))
+    
+    badge_class = "mode-online" if mode_info["is_online"] else "mode-offline"
+    
+    st.markdown(
+        f"""
+        <div class="mode-badge {badge_class}">
+            {mode_info["icon"]} {mode_info["label"]}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-# ── Main render function ──────────────────────────────────────────────────────
+def _render_user_section() -> None:
+    """Render user session info if authenticated."""
+    token = st.session_state.get("auth_token")
+    if not token:
+        return
 
-def render_sidebar(is_online: bool) -> dict | None:
+    user = get_session_user(token)
+    if not user:
+        return
+
+    role = user.get("role", "").upper()
+    full_name = user.get("full_name", user.get("username", "User"))
+
+    st.markdown("### 👤 User")
+    st.markdown(f"**{full_name}**")
+    st.caption(f"Role: {role}")
+
+    # Logout button
+    if st.sidebar.button("🚪 Logout", key="logout_btn", use_container_width=True):
+        logout(token)
+        st.session_state.clear()
+        st.rerun()
+
+    st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
+
+
+def _render_patient_form() -> Dict[str, Any]:
     """
-    Renders the complete sidebar UI inside st.sidebar.
+    Render the patient input form.
+    Returns dict of form values.
+    """
+    st.markdown("### 🫀 Patient Data")
 
-    Parameters
-    ----------
-    is_online : bool
-        Result from core/mode_detector.py. Controls which badge
-        is displayed and which features are enabled.
+    # Initialize form state
+    if "patient_form" not in st.session_state:
+        st.session_state.patient_form = {}
+
+    form_data = st.session_state.patient_form
+
+    # Load sample button
+    if st.button("📋 Load Sample", key="load_sample", use_container_width=True):
+        sample = load_sample_input()
+        if sample:
+            st.session_state.patient_form = sample
+            st.rerun()
+
+    # Clear button
+    if st.button("🗑️ Clear Form", key="clear_form", use_container_width=True):
+        st.session_state.patient_form = {}
+        st.rerun()
+
+    st.markdown("---")
+
+    # Patient name
+    form_data["name"] = st.text_input(
+        "Patient Name",
+        value=form_data.get("name", ""),
+        key="input_name",
+        placeholder="Enter patient name",
+    )
+
+    # Age
+    form_data["age"] = st.number_input(
+        "Age (years)",
+        min_value=1,
+        max_value=120,
+        value=form_data.get("age", 50),
+        key="input_age",
+    )
+
+    # Sex
+    sex_options = {"Male": 1, "Female": 0}
+    form_data["sex"] = st.radio(
+        "Sex",
+        options=list(sex_options.keys()),
+        index=list(sex_options.values()).index(form_data.get("sex", 1)),
+        key="input_sex",
+        horizontal=True,
+    )
+    form_data["sex"] = sex_options[form_data["sex"]]
+
+    # Chest Pain Type
+    cp_labels = {v: k for k, v in CHEST_PAIN_LABELS.items()}
+    form_data["cp"] = st.selectbox(
+        "Chest Pain Type",
+        options=list(CHEST_PAIN_LABELS.values()),
+        index=cp_labels.get(form_data.get("cp", 0), 0),
+        key="input_cp",
+        format_func=lambda x: x,
+    )
+    form_data["cp"] = cp_labels[form_data["cp"]]
+
+    # Resting BP
+    form_data["trestbps"] = st.number_input(
+        "Resting BP (mm Hg)",
+        min_value=60,
+        max_value=250,
+        value=form_data.get("trestbps", 120),
+        key="input_trestbps",
+    )
+
+    # Cholesterol
+    form_data["chol"] = st.number_input(
+        "Cholesterol (mg/dl)",
+        min_value=50,
+        max_value=700,
+        value=form_data.get("chol", 200),
+        key="input_chol",
+    )
+
+    # Fasting Blood Sugar
+    form_data["fbs"] = st.selectbox(
+        "Fasting Blood Sugar > 120 mg/dl",
+        options=["No", "Yes"],
+        index=form_data.get("fbs", 0),
+        key="input_fbs",
+    )
+    form_data["fbs"] = 1 if form_data["fbs"] == "Yes" else 0
+
+    # Resting ECG
+    ecg_labels = {v: k for k, v in RESTECG_LABELS.items()}
+    form_data["restecg"] = st.selectbox(
+        "Resting ECG",
+        options=list(RESTECG_LABELS.values()),
+        index=ecg_labels.get(form_data.get("restecg", 0), 0),
+        key="input_restecg",
+    )
+    form_data["restecg"] = ecg_labels[form_data["restecg"]]
+
+    # Max Heart Rate
+    form_data["thalach"] = st.number_input(
+        "Max Heart Rate (bpm)",
+        min_value=50,
+        max_value=250,
+        value=form_data.get("thalach", 150),
+        key="input_thalach",
+    )
+
+    # Exercise Angina
+    form_data["exang"] = st.selectbox(
+        "Exercise-Induced Angina",
+        options=["No", "Yes"],
+        index=form_data.get("exang", 0),
+        key="input_exang",
+    )
+    form_data["exang"] = 1 if form_data["exang"] == "Yes" else 0
+
+    # Oldpeak
+    form_data["oldpeak"] = st.number_input(
+        "ST Depression (oldpeak)",
+        min_value=0.0,
+        max_value=10.0,
+        value=float(form_data.get("oldpeak", 0.0)),
+        step=0.1,
+        key="input_oldpeak",
+    )
+
+    # Slope
+    slope_labels = {v: k for k, v in SLOPE_LABELS.items()}
+    form_data["slope"] = st.selectbox(
+        "ST Slope",
+        options=list(SLOPE_LABELS.values()),
+        index=slope_labels.get(form_data.get("slope", 0), 0),
+        key="input_slope",
+    )
+    form_data["slope"] = slope_labels[form_data["slope"]]
+
+    # CA (Major Vessels)
+    form_data["ca"] = st.selectbox(
+        "Major Vessels (0-3)",
+        options=[0, 1, 2, 3],
+        index=form_data.get("ca", 0),
+        key="input_ca",
+    )
+
+    # Thalassemia
+    thal_labels = {v: k for k, v in THAL_LABELS.items()}
+    form_data["thal"] = st.selectbox(
+        "Thalassemia",
+        options=list(THAL_LABELS.values()),
+        index=thal_labels.get(form_data.get("thal", 1), 0),
+        key="input_thal",
+    )
+    form_data["thal"] = thal_labels[form_data["thal"]]
+
+    # Symptoms (optional)
+    form_data["symptoms"] = st.text_area(
+        "Symptoms (optional)",
+        value=form_data.get("symptoms", ""),
+        key="input_symptoms",
+        placeholder="Describe any symptoms...",
+        height=80,
+    )
+
+    return form_data
+
+
+def _render_sync_section() -> None:
+    """Render sync status and controls."""
+    st.markdown("### 🔄 Sync Status")
+
+    sync_status = get_sync_status()
+    online = sync_status.get("online", False)
+    cloud_available = sync_status.get("cloud_available", False)
+    pending = sync_status.get("pending_count", 0)
+    failed = sync_status.get("failed_count", 0)
+
+    # Status indicators
+    if online and cloud_available:
+        st.markdown(
+            '<span class="status-dot status-ok"></span>Cloud Connected',
+            unsafe_allow_html=True,
+        )
+    elif online:
+        st.markdown(
+            '<span class="status-dot status-warn"></span>Cloud Unavailable',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<span class="status-dot status-error"></span>Offline',
+            unsafe_allow_html=True,
+        )
+
+    # Pending/Failed counts
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Pending", pending)
+    with col2:
+        st.metric("Failed", failed)
+
+    # Sync button
+    if st.button(
+        "🔄 Sync Now",
+        key="sync_now_btn",
+        use_container_width=True,
+        disabled=not online,
+    ):
+        with st.spinner("Syncing..."):
+            result = force_sync()
+            if result.get("success"):
+                st.toast(
+                    f"✅ Synced {result.get('synced_count', 0)} items",
+                    icon="✅",
+                )
+            else:
+                st.toast(
+                    f"❌ {result.get('message', 'Sync failed')}",
+                    icon="❌",
+                )
+            st.rerun()
+
+    # Auto-sync toggle
+    auto_sync = is_sync_active()
+    new_auto_sync = st.toggle(
+        "Auto-Sync",
+        value=auto_sync,
+        key="auto_sync_toggle",
+        help="Automatically sync when online",
+    )
+    if new_auto_sync != auto_sync:
+        if new_auto_sync:
+            start_auto_sync()
+            st.toast("Auto-sync enabled", icon="🔄")
+        else:
+            stop_auto_sync()
+            st.toast("Auto-sync disabled", icon="⏸️")
+        st.rerun()
+
+    st.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
+
+
+def _render_system_status() -> None:
+    """Render collapsible system status panel."""
+    with st.expander("🔧 System Status", expanded=False):
+        # Mode info
+        conn_info = get_connection_info()
+        st.markdown("**Connectivity**")
+        st.caption(f"Mode: {conn_info.get('mode', 'unknown')}")
+        st.caption(f"Latency: {conn_info.get('latency_ms', 'N/A')} ms")
+        st.caption(f"Host: {conn_info.get('host', 'N/A')}")
+
+        # Refresh button
+        if st.button("🔄 Refresh", key="refresh_conn", use_container_width=True):
+            invalidate_cache()
+            st.rerun()
+
+        # Sync stats
+        sync_status = get_sync_status()
+        st.markdown("**Sync**")
+        st.caption(f"Cycles: {sync_status.get('cycles_run', 0)}")
+        st.caption(f"Total Synced: {sync_status.get('total_synced', 0)}")
+        st.caption(f"Last Sync: {sync_status.get('last_sync_time', 'Never')}")
+
+        # App version
+        st.markdown(f"**{APP_NAME}** v{APP_VERSION}")
+        st.caption(f"Time: {now_str()}")
+
+
+# ─────────────────────────────────────────────
+# Main render function
+# ─────────────────────────────────────────────
+
+def render_sidebar() -> Dict[str, Any]:
+    """
+    Render the complete sidebar.
 
     Returns
     -------
-    dict | None
-        A dictionary of validated patient data when the doctor
-        clicks Submit. Returns None if not yet submitted or if
-        validation fails.
+    dict with sidebar state:
+        {
+            "patient_data": dict,
+            "submit_clicked": bool,
+        }
     """
+    # Inject CSS
+    st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
 
-    # Inject styles once
-    st.sidebar.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
-
-    # Logo
-    st.sidebar.markdown("""
-    <div class="sidebar-logo">
-        <div class="logo-icon">🫀</div>
-        <div>
-            <div class="logo-text">AuraCure</div>
-            <div class="logo-sub">CARDIAC DECISION SUPPORT</div>
+    # Header
+    st.sidebar.markdown(
+        f"""
+        <div class="sidebar-header">
+            {PAGE_ICON} {APP_NAME}
         </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Online / Offline badge
-    st.sidebar.markdown(_build_mode_badge(is_online), unsafe_allow_html=True)
-
-    # ── Section 1: Patient Identity ──────────────────────────────────────────
-    st.sidebar.markdown('<div class="form-section-title">👤 Patient Identity</div>',
-                        unsafe_allow_html=True)
-
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        age = st.number_input(
-            "Age (years)", min_value=1, max_value=120,
-            value=50, step=1, key="age"
-        )
-    with col2:
-        gender = st.selectbox("Gender", GENDER_OPTIONS, key="gender")
-
-    patient_name = st.sidebar.text_input(
-        "Patient ID / Name (optional)", placeholder="e.g. P-00142",
-        key="patient_name"
+        """,
+        unsafe_allow_html=True,
     )
 
-    # ── Section 2: Symptoms ──────────────────────────────────────────────────
-    st.sidebar.markdown('<div class="form-section-title">🩺 Presenting Symptoms</div>',
-                        unsafe_allow_html=True)
+    # Mode badge
+    _render_mode_badge()
 
-    symptoms = st.sidebar.multiselect(
-        "Select all symptoms present",
-        options=SYMPTOM_OPTIONS,
-        default=[],
-        key="symptoms"
+    # User section
+    _render_user_section()
+
+    # Patient form
+    patient_data = _render_patient_form()
+
+    # Submit button
+    submit_clicked = st.sidebar.button(
+        "🔍 Analyze Patient",
+        key="analyze_btn",
+        use_container_width=True,
+        type="primary",
     )
 
-    symptom_duration = st.sidebar.selectbox(
-        "Duration of symptoms",
-        ["< 24 hours", "1–7 days", "1–4 weeks", "> 1 month", "Not applicable"],
-        key="symptom_duration"
-    )
+    st.sidebar.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
 
-    # ── Section 3: Vitals ────────────────────────────────────────────────────
-    st.sidebar.markdown('<div class="form-section-title">📊 Vitals</div>',
-                        unsafe_allow_html=True)
+    # Sync section
+    _render_sync_section()
 
-    col3, col4 = st.sidebar.columns(2)
-    with col3:
-        bp_systolic = st.number_input(
-            "BP Systolic (mmHg)", min_value=60, max_value=250,
-            value=120, step=1, key="bp_sys"
-        )
-    with col4:
-        bp_diastolic = st.number_input(
-            "BP Diastolic (mmHg)", min_value=40, max_value=150,
-            value=80, step=1, key="bp_dia"
-        )
-
-    heart_rate = st.sidebar.slider(
-        "Heart Rate (bpm)", min_value=30, max_value=200,
-        value=75, step=1, key="heart_rate"
-    )
-
-    col5, col6 = st.sidebar.columns(2)
-    with col5:
-        cholesterol = st.number_input(
-            "Cholesterol (mg/dL)", min_value=50, max_value=600,
-            value=200, step=1, key="cholesterol"
-        )
-    with col6:
-        glucose = st.number_input(
-            "Glucose (mg/dL)", min_value=50, max_value=600,
-            value=100, step=1, key="glucose"
-        )
-
-    # ── Section 4: Risk Factors ──────────────────────────────────────────────
-    st.sidebar.markdown('<div class="form-section-title">⚠️ Risk Factors</div>',
-                        unsafe_allow_html=True)
-
-    smoking   = st.sidebar.selectbox("Smoking status", SMOKING_OPTIONS, key="smoking")
-    diabetes  = st.sidebar.selectbox("Diabetes", DIABETES_OPTIONS, key="diabetes")
-
-    col7, col8 = st.sidebar.columns(2)
-    with col7:
-        family_history = st.checkbox("Family history\nof heart disease", key="family_history")
-    with col8:
-        hypertension = st.checkbox("Known\nhypertension", key="hypertension")
-
-    # ── Submit button ────────────────────────────────────────────────────────
-    st.sidebar.markdown("<br>", unsafe_allow_html=True)
-    submitted = st.sidebar.button("🔍 Analyse Patient", use_container_width=True)
-
-    # ── Medical disclaimer ───────────────────────────────────────────────────
-    st.sidebar.markdown("""
-    <div class="disclaimer-box">
-        ⚠️ <strong>Clinical Decision Support Only.</strong><br>
-        AuraCure assists — it does not replace — qualified medical
-        professionals. All output must be reviewed by a licensed physician.
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Return payload only on submission ────────────────────────────────────
-    if not submitted:
-        return None
-
-    # Basic inline validation before passing to validators.py
-    if not symptoms:
-        st.sidebar.error("⚠️ Please select at least one symptom.")
-        return None
-
-    if bp_systolic <= bp_diastolic:
-        st.sidebar.error("⚠️ Systolic BP must be greater than Diastolic BP.")
-        return None
+    # System status
+    _render_system_status()
 
     return {
-        "patient_name"      : patient_name or f"Patient-{age}{gender[0]}",
-        "age"               : age,
-        "gender"            : gender,
-        "symptoms"          : symptoms,
-        "symptom_duration"  : symptom_duration,
-        "bp_systolic"       : bp_systolic,
-        "bp_diastolic"      : bp_diastolic,
-        "heart_rate"        : heart_rate,
-        "cholesterol"       : cholesterol,
-        "glucose"           : glucose,
-        "smoking"           : smoking,
-        "diabetes"          : diabetes,
-        "family_history"    : family_history,
-        "hypertension"      : hypertension,
-        "is_online"         : is_online,
+        "patient_data": patient_data,
+        "submit_clicked": submit_clicked,
     }

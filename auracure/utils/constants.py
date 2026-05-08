@@ -15,11 +15,10 @@ AUTHOR = "AuraEcho Team"
 # -----------------------------------------------------------------------------
 # RISK LEVEL LABELS & THRESHOLDS
 # -----------------------------------------------------------------------------
-# Risk score is a float in [0.0, 1.0] produced by risk_model.py
 RISK_LEVELS = {
-    "LOW":    (0.0,  0.35),   # score < 0.35
-    "MEDIUM": (0.35, 0.65),   # 0.35 <= score < 0.65
-    "HIGH":   (0.65, 1.01),   # score >= 0.65
+    "LOW":    (0.0,  0.35),
+    "MEDIUM": (0.35, 0.65),
+    "HIGH":   (0.65, 1.0),    # FIXED: was 1.01
 }
 
 RISK_LABELS = {
@@ -29,9 +28,9 @@ RISK_LABELS = {
 }
 
 RISK_COLORS = {
-    "LOW":    "#2ecc71",   # green
-    "MEDIUM": "#f39c12",   # amber
-    "HIGH":   "#e74c3c",   # red
+    "LOW":    "#2ecc71",
+    "MEDIUM": "#f39c12",
+    "HIGH":   "#e74c3c",
 }
 
 RISK_ICONS = {
@@ -61,25 +60,24 @@ RISK_DESCRIPTIONS = {
 FEATURE_COLUMNS = [
     "age",
     "sex",
-    "cp",           # chest pain type (0–3)
-    "trestbps",     # resting blood pressure (mm Hg)
-    "chol",         # serum cholesterol (mg/dl)
-    "fbs",          # fasting blood sugar > 120 mg/dl (1 = true)
-    "restecg",      # resting ECG results (0–2)
-    "thalach",      # maximum heart rate achieved
-    "exang",        # exercise-induced angina (1 = yes)
-    "oldpeak",      # ST depression induced by exercise
-    "slope",        # slope of peak exercise ST segment (0–2)
-    "ca",           # number of major vessels coloured by fluoroscopy (0–3)
-    "thal",         # thalassemia (1 = normal; 2 = fixed defect; 3 = reversible)
+    "cp",
+    "trestbps",
+    "chol",
+    "fbs",
+    "restecg",
+    "thalach",
+    "exang",
+    "oldpeak",
+    "slope",
+    "ca",
+    "thal",
 ]
 
-TARGET_COLUMN = "target"   # 1 = disease present, 0 = absent
+TARGET_COLUMN = "target"
 
 CATEGORICAL_FEATURES = ["sex", "cp", "fbs", "restecg", "exang", "slope", "ca", "thal"]
 NUMERICAL_FEATURES   = ["age", "trestbps", "chol", "thalach", "oldpeak"]
 
-# Human-readable feature labels for UI display
 FEATURE_LABELS = {
     "age":      "Age (years)",
     "sex":      "Sex (1 = Male, 0 = Female)",
@@ -96,7 +94,7 @@ FEATURE_LABELS = {
     "thal":     "Thalassemia Type",
 }
 
-# Valid value ranges for each numerical feature (used by validators.py)
+# Numerical feature value ranges
 FEATURE_RANGES = {
     "age":      (1,   120),
     "trestbps": (60,  250),
@@ -105,7 +103,7 @@ FEATURE_RANGES = {
     "oldpeak":  (0.0, 10.0),
 }
 
-# Valid discrete values for categorical features
+# Categorical feature valid values
 FEATURE_VALID_VALUES = {
     "sex":     [0, 1],
     "cp":      [0, 1, 2, 3],
@@ -118,7 +116,66 @@ FEATURE_VALID_VALUES = {
 }
 
 # -----------------------------------------------------------------------------
-# CHEST PAIN TYPE LABELS
+# CATEGORICAL ENCODINGS  →  core/preprocess.py
+# ADDED: was missing — caused ImportError in preprocess.py
+# -----------------------------------------------------------------------------
+CATEGORICAL_ENCODINGS = {
+    "sex": {
+        "female": 0, "male": 1,
+        "Female": 0, "Male": 1,
+        "0": 0, "1": 1,
+    },
+    "cp": {
+        "typical angina":    0,
+        "atypical angina":   1,
+        "non-anginal pain":  2,
+        "asymptomatic":      3,
+        "Typical Angina":    0,
+        "Atypical Angina":   1,
+        "Non-Anginal Pain":  2,
+        "Asymptomatic":      3,
+    },
+    "fbs": {
+        "no": 0,  "yes": 1,
+        "No": 0,  "Yes": 1,
+        "false": 0, "true": 1,
+        "False": 0, "True": 1,
+    },
+    "restecg": {
+        "normal":                        0,
+        "st-t wave abnormality":         1,
+        "left ventricular hypertrophy":  2,
+        "Normal":                        0,
+        "ST-T Wave Abnormality":         1,
+        "Left Ventricular Hypertrophy":  2,
+    },
+    "exang": {
+        "no": 0,  "yes": 1,
+        "No": 0,  "Yes": 1,
+    },
+    "slope": {
+        "upsloping":   0,
+        "flat":        1,
+        "downsloping": 2,
+        "Upsloping":   0,
+        "Flat":        1,
+        "Downsloping": 2,
+    },
+    "ca": {
+        "0": 0, "1": 1, "2": 2, "3": 3,
+    },
+    "thal": {
+        "normal":            1,
+        "fixed defect":      2,
+        "reversible defect": 3,
+        "Normal":            1,
+        "Fixed Defect":      2,
+        "Reversible Defect": 3,
+    },
+}
+
+# -----------------------------------------------------------------------------
+# CHEST PAIN / CATEGORICAL DECODE LABELS  →  ui/ + helpers.py
 # -----------------------------------------------------------------------------
 CHEST_PAIN_LABELS = {
     0: "Typical Angina",
@@ -146,19 +203,18 @@ RESTECG_LABELS = {
 }
 
 # -----------------------------------------------------------------------------
-# SIMILARITY ENGINE (KNN) SETTINGS  →  core/similarity.py
+# SIMILARITY ENGINE (KNN)  →  core/similarity.py
 # -----------------------------------------------------------------------------
-KNN_N_NEIGHBORS        = 5          # neighbours to retrieve
-KNN_TOP_DISPLAY        = 3          # top matches shown in UI
-KNN_METRIC             = "cosine"   # distance metric: "cosine" | "euclidean"
-KNN_ALGORITHM          = "brute"    # sklearn KNN algorithm
-SIMILARITY_SCORE_MIN   = 0.0        # similarity normalised to [0, 1]
-SIMILARITY_SCORE_MAX   = 1.0
+KNN_N_NEIGHBORS      = 5
+KNN_TOP_DISPLAY      = 3
+KNN_METRIC           = "cosine"
+KNN_ALGORITHM        = "brute"
+SIMILARITY_SCORE_MIN = 0.0
+SIMILARITY_SCORE_MAX = 100.0
+SIMILARITY_POOL_SIZE = 50      # ADDED: pool size for filtered similarity search
 
 # -----------------------------------------------------------------------------
 # RISK MODEL WEIGHTS  →  core/risk_model.py
-# Feature importance weights used in the hand-crafted risk scorer.
-# Weights sum to 1.0 for interpretability.
 # -----------------------------------------------------------------------------
 RISK_WEIGHTS = {
     "age":      0.10,
@@ -176,38 +232,72 @@ RISK_WEIGHTS = {
     "thal":     0.02,
 }
 
-# Normalisation baselines used when computing risk contribution per feature
+# FIXED: Derived from FEATURE_RANGES — no duplication
 RISK_BASELINES = {
-    "age":      {"min": 1,   "max": 120},
-    "trestbps": {"min": 60,  "max": 250},
-    "chol":     {"min": 50,  "max": 700},
-    "thalach":  {"min": 50,  "max": 250},
-    "oldpeak":  {"min": 0.0, "max": 10.0},
+    feat: {"min": rng[0], "max": rng[1]}
+    for feat, rng in FEATURE_RANGES.items()
 }
 
 # -----------------------------------------------------------------------------
-# AI / LLM MODEL NAMES  →  ai/offline_ai.py, ai/online_ai.py
+# RANDOM FOREST HYPERPARAMETERS  →  core/risk_model.py
+# -----------------------------------------------------------------------------
+RF_N_ESTIMATORS  = 200
+RF_MAX_DEPTH     = 12
+RF_RANDOM_STATE  = 42
+
+# -----------------------------------------------------------------------------
+# EXPLANATION THRESHOLDS  →  core/risk_model.py
+# -----------------------------------------------------------------------------
+CONFIDENCE_LOW_THRESHOLD  = 60.0
+CONFIDENCE_HIGH_THRESHOLD = 85.0
+
+# -----------------------------------------------------------------------------
+# AI / LLM MODEL NAMES
 # -----------------------------------------------------------------------------
 
-# Offline (Ollama local inference)
+# ── Offline (Ollama) ──────────────────────────────────────────────────────────
 OFFLINE_MODEL_NAME    = "llama3"
-OFFLINE_MODEL_TIMEOUT = 60          # seconds before timeout
+OFFLINE_MODEL_TIMEOUT = 60
 OFFLINE_BASE_URL      = "http://localhost:11434"
 
-# Online (Groq — fast cloud inference)
-ONLINE_PROVIDER       = "groq"
-ONLINE_MODEL_NAME     = "llama3-70b-8192"
-ONLINE_MODEL_TIMEOUT  = 30
-GROQ_API_BASE_URL     = "https://api.groq.com/openai/v1"
+# ADDED: Ollama aliases — needed by ai/offline_ai.py
+OLLAMA_BASE_URL    = OFFLINE_BASE_URL
+OLLAMA_MODEL       = OFFLINE_MODEL_NAME
+OLLAMA_TIMEOUT     = OFFLINE_MODEL_TIMEOUT
 
-# Fallback online provider if Groq is unavailable
-FALLBACK_PROVIDER     = "openai"
-FALLBACK_MODEL_NAME   = "gpt-3.5-turbo"
+# ── Online (Groq primary) ─────────────────────────────────────────────────────
+ONLINE_PROVIDER    = "groq"
+ONLINE_MODEL_NAME  = "llama3-70b-8192"
+ONLINE_MODEL_TIMEOUT = 30
+GROQ_API_BASE_URL  = "https://api.groq.com/openai/v1"
 
-# Shared LLM generation settings
-LLM_MAX_TOKENS        = 1024
-LLM_TEMPERATURE       = 0.3        # lower = more deterministic / clinical
-LLM_TOP_P             = 0.9
+# ADDED: Groq aliases — needed by ai/online_ai.py
+GROQ_MODEL         = ONLINE_MODEL_NAME
+GROQ_TIMEOUT       = ONLINE_MODEL_TIMEOUT
+
+# ── Online fallback (OpenAI) ──────────────────────────────────────────────────
+FALLBACK_PROVIDER   = "openai"
+FALLBACK_MODEL_NAME = "gpt-3.5-turbo"
+
+# ADDED: OpenAI aliases — needed by ai/online_ai.py
+OPENAI_MODEL        = FALLBACK_MODEL_NAME
+OPENAI_TIMEOUT      = ONLINE_MODEL_TIMEOUT
+
+# ── Shared LLM generation settings ───────────────────────────────────────────
+LLM_MAX_TOKENS   = 1024
+LLM_TEMPERATURE  = 0.3
+LLM_TOP_P        = 0.9
+
+# ADDED: Per-provider token/temp aliases — needed by ai/online_ai.py + offline_ai.py
+OLLAMA_MAX_TOKENS   = LLM_MAX_TOKENS
+OLLAMA_TEMPERATURE  = LLM_TEMPERATURE
+GROQ_MAX_TOKENS     = LLM_MAX_TOKENS
+GROQ_TEMPERATURE    = LLM_TEMPERATURE
+OPENAI_MAX_TOKENS   = LLM_MAX_TOKENS
+OPENAI_TEMPERATURE  = LLM_TEMPERATURE
+
+# ADDED: Shared API timeout — needed by ai/online_ai.py
+API_TIMEOUT = ONLINE_MODEL_TIMEOUT
 
 # -----------------------------------------------------------------------------
 # PROMPT SETTINGS  →  ai/prompt_builder.py
@@ -218,8 +308,8 @@ PROMPT_SYSTEM_ROLE = (
     "Always remind the physician that AI output is supportive, not diagnostic."
 )
 
-PROMPT_MAX_SIMILAR_CASES = 5  # how many similar cases to embed in the prompt
-PROMPT_INCLUDE_DISCLAIMER = True
+PROMPT_MAX_SIMILAR_CASES   = 5
+PROMPT_INCLUDE_DISCLAIMER  = True
 
 # -----------------------------------------------------------------------------
 # DATABASE  →  database/local_db.py, database/cloud_db.py
@@ -234,36 +324,93 @@ FIREBASE_COLLECTION   = "auraecho_records"
 MONGO_DB_NAME         = "auraecho"
 MONGO_COLLECTION      = "patient_records"
 
-SYNC_BATCH_SIZE       = 50     # number of offline records pushed per sync cycle
+SYNC_BATCH_SIZE       = 50
 
 # -----------------------------------------------------------------------------
 # NETWORK / CONNECTIVITY  →  core/mode_detector.py
 # -----------------------------------------------------------------------------
+
+# ADDED: TCP host tuples — mode_detector.py uses socket probing not HTTP
+CONNECTIVITY_CHECK_HOSTS = [
+    ("8.8.8.8",        53),   # Google DNS
+    ("1.1.1.1",        53),   # Cloudflare DNS
+    ("208.67.222.222", 53),   # OpenDNS
+    ("api.groq.com",   443),  # Groq API
+]
+
+# Kept for reference (HTTP-based, not used by mode_detector)
 CONNECTIVITY_CHECK_URLS = [
     "https://www.google.com",
     "https://api.groq.com",
     "https://cloudflare.com",
 ]
-CONNECTIVITY_TIMEOUT    = 3     # seconds
-CONNECTIVITY_RETRIES    = 2
+
+CONNECTIVITY_TIMEOUT   = 3     # seconds per probe
+CONNECTIVITY_RETRIES   = 2     # retries per host
+CONNECTIVITY_CACHE_TTL = 30    # ADDED: seconds before re-probing
 
 MODE_ONLINE  = "online"
 MODE_OFFLINE = "offline"
 
+# ADDED: UI mode labels — needed by core/mode_detector.py
+MODE_ONLINE_LABEL  = "🟢 Online"
+MODE_OFFLINE_LABEL = "🔴 Offline"
+
 # -----------------------------------------------------------------------------
 # AUTHENTICATION  →  services/auth_service.py
 # -----------------------------------------------------------------------------
-SESSION_EXPIRY_MINUTES = 480    # 8-hour clinical shift
-JWT_ALGORITHM          = "HS256"
-PASSWORD_MIN_LENGTH    = 8
-MAX_LOGIN_ATTEMPTS     = 5
-LOCKOUT_DURATION_MIN   = 15     # minutes after max failed attempts
+SESSION_TTL_HOURS      = 8
+SESSION_EXPIRY_MINUTES = SESSION_TTL_HOURS * 60   # FIXED: derived, no duplicate
+
+JWT_ALGORITHM        = "HS256"
+PASSWORD_MIN_LENGTH  = 8
+MAX_LOGIN_ATTEMPTS   = 5
+LOCKOUT_DURATION_MIN = 15
+
+AUTH_DB_PATH = "database/auth.db"
 
 ROLES = {
-    "DOCTOR":     "doctor",
-    "NURSE":      "nurse",
-    "ADMIN":      "admin",
-    "VIEWER":     "viewer",
+    "DOCTOR": "doctor",
+    "NURSE":  "nurse",
+    "ADMIN":  "admin",
+    "VIEWER": "viewer",
+}
+
+# Role value aliases
+ROLE_DOCTOR = ROLES["DOCTOR"]
+ROLE_NURSE  = ROLES["NURSE"]
+ROLE_ADMIN  = ROLES["ADMIN"]
+
+# -----------------------------------------------------------------------------
+# ROLE PERMISSIONS MAP  →  services/auth_service.py + ui/role_dashboard.py
+# -----------------------------------------------------------------------------
+ROLE_PERMISSIONS = {
+    "doctor": [
+        "view_dashboard",
+        "view_diagnosis",
+        "edit_patient",
+        "view_analytics",
+        "manage_patients",
+        "view_ai_insights",
+        "export_reports",
+    ],
+    "nurse": [
+        "view_dashboard",
+        "view_diagnosis",
+        "view_patient",
+        "enter_vitals",
+    ],
+    "admin": [
+        "view_dashboard",
+        "manage_users",
+        "view_analytics",
+        "system_settings",
+        "export_reports",
+    ],
+    "viewer": [
+        "view_dashboard",
+        "view_patient",
+    ],
 }
 
 # -----------------------------------------------------------------------------
@@ -275,33 +422,58 @@ ASSETS_CSS_PATH    = "assets/styles.css"
 ASSETS_LOGO_PATH   = "assets/logo.png"
 
 # -----------------------------------------------------------------------------
+# MODEL SAVE PATHS  →  core/risk_model.py
+# -----------------------------------------------------------------------------
+MODEL_SAVE_PATH  = "models/risk_model.pkl"
+SCALER_SAVE_PATH = "models/scaler.pkl"
+
+# -----------------------------------------------------------------------------
+# UI THEME COLORS  →  ui/ modules
+# -----------------------------------------------------------------------------
+UI_PRIMARY_COLOR    = "#1a73e8"
+UI_SECONDARY_COLOR  = "#ffffff"
+UI_BACKGROUND_COLOR = "#f0f4f8"
+UI_CARD_COLOR       = "#ffffff"
+UI_TEXT_PRIMARY     = "#1a1a2e"
+UI_TEXT_SECONDARY   = "#5f6368"
+UI_BORDER_COLOR     = "#e8f0fe"
+UI_SUCCESS_COLOR    = "#2ecc71"
+UI_WARNING_COLOR    = "#f39c12"
+UI_DANGER_COLOR     = "#e74c3c"
+UI_SHADOW           = "0 2px 8px rgba(0,0,0,0.08)"
+
+# -----------------------------------------------------------------------------
 # UI / STREAMLIT  →  ui/ modules
 # -----------------------------------------------------------------------------
-PAGE_TITLE         = "AuraEcho+ | Cardiac AI"
-PAGE_ICON          = "🫀"
-PAGE_LAYOUT        = "wide"
-SIDEBAR_STATE      = "expanded"
+PAGE_TITLE     = "AuraEcho+ | Cardiac AI"
+PAGE_ICON      = "🫀"
+PAGE_LAYOUT    = "wide"
+SIDEBAR_STATE  = "expanded"
 
-# Plotly chart theme
-CHART_THEME        = "plotly_dark"
-CHART_FONT_FAMILY  = "Inter, sans-serif"
-CHART_BG_COLOR     = "#0f1117"
-CHART_GRID_COLOR   = "#2a2a3e"
+CHART_THEME       = "plotly_dark"
+CHART_FONT_FAMILY = "Inter, sans-serif"
+CHART_BG_COLOR    = "#0f1117"
+CHART_GRID_COLOR  = "#2a2a3e"
 
-# Number of similar cases displayed in the results panel
-RESULTS_TOP_N_CASES = 3
+RESULTS_TOP_N_CASES = 5
+
+# -----------------------------------------------------------------------------
+# SYNC SERVICE  →  services/sync_service.py
+# -----------------------------------------------------------------------------
+SYNC_INTERVAL_SECONDS = 300
+MAX_SYNC_RETRIES      = 3
 
 # -----------------------------------------------------------------------------
 # LOGGING
 # -----------------------------------------------------------------------------
-LOG_LEVEL  = "INFO"    # DEBUG | INFO | WARNING | ERROR | CRITICAL
+LOG_LEVEL  = "INFO"
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 LOG_FILE   = "auraecho.log"
 
 # -----------------------------------------------------------------------------
 # MISCELLANEOUS
 # -----------------------------------------------------------------------------
-DECIMAL_PRECISION = 4      # float rounding for scores / probabilities
+DECIMAL_PRECISION = 4
 DATE_FORMAT       = "%Y-%m-%d %H:%M:%S"
 UNKNOWN_LABEL     = "Unknown"
 NA_PLACEHOLDER    = "N/A"

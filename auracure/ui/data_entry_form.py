@@ -1,724 +1,729 @@
-"""
-ui/data_entry_form.py
-─────────────────────────────────────────────────────────────────
-AuraCure — Structured Patient Data Entry Form
-─────────────────────────────────────────────────────────────────
-PURPOSE:
-    A dedicated full-page patient data entry form with:
-    - Personal details (name, age, gender, contact)
-    - Symptom checklist with severity sliders
-    - Vitals input (BP, HR, cholesterol, glucose, BMI)
-    - Medical history (smoking, diabetes, family history)
-    - Medical report upload section (PDF/image)
-    - Form progress indicator
-    - Save as draft + Submit buttons
-
-USED BY:
-    app.py — rendered as a separate tab/page
-    Passes validated patient dict → core/ pipeline
-
-IMPORTS FROM:
-    utils/validators.py  — validate_patient()
-    utils/constants.py   — field ranges, symptom list
-─────────────────────────────────────────────────────────────────
-"""
+# =============================================================================
+# ui/data_entry_form.py
+# AuraEcho+ — Structured Patient Data Entry Form
+#
+# Responsibility:
+#     Render a comprehensive patient data entry form with real-time validation,
+#     clear error feedback, and structured sections. Used for dedicated data
+#     entry pages and as a reusable component.
+#
+# Features:
+#     • Real-time field validation with error messages
+#     • Sectioned layout (Demographics, Vitals, Clinical, Test Results)
+#     • Load sample / Clear form controls
+#     • Role-aware submit permissions
+#     • Session state persistence
+#     • Validation summary before submit
+#
+# Public API:
+#     render_data_entry_form(form_key, initial_data, show_submit) → dict
+# =============================================================================
 
 import streamlit as st
-import json
-from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from utils.constants import (
+    FEATURE_COLUMNS,
+    FEATURE_LABELS,
+    FEATURE_RANGES,
+    FEATURE_VALID_VALUES,
+    CATEGORICAL_FEATURES,
+    NUMERICAL_FEATURES,
+    CHEST_PAIN_LABELS,
+    THAL_LABELS,
+    SLOPE_LABELS,
+    RESTECG_LABELS,
+    UI_PRIMARY_COLOR,
+    UI_SUCCESS_COLOR,
+    UI_WARNING_COLOR,
+    UI_DANGER_COLOR,
+    ROLE_PERMISSIONS,
+)
+from utils.validators import (
+    validate_patient,
+    validate_single_field,
+    validate_patient_name,
+    errors_to_str,
+)
+from utils.helpers import get_logger, load_sample_input, patient_to_display
+from services.auth_service import user_has_permission
+
+logger = get_logger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────
-# CSS
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# CSS Styles
+# ─────────────────────────────────────────────
 
-DATA_ENTRY_CSS = """
+FORM_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&display=swap');
-
-/* Reset */
-.main .block-container { padding-top: 1.2rem !important; }
-*, .stMarkdown { font-family: 'DM Sans', sans-serif !important; }
-
-/* ── Page title ── */
-.form-page-header {
-    background: white;
-    border: 1.5px solid #E0E7FF;
-    border-left: 5px solid #3B5BDB;
-    border-radius: 12px;
-    padding: 20px 26px;
-    margin-bottom: 28px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-}
-.form-page-icon  { font-size: 36px; }
-.form-page-title { font-size: 20px; font-weight: 700; color: #1E3A8A; margin:0; }
-.form-page-sub   { font-size: 12px; color: #6B7AB8; margin-top:3px; }
-
-/* ── Progress bar ── */
-.form-progress-wrap {
-    margin-bottom: 24px;
-}
-.form-progress-label {
-    display: flex; justify-content: space-between;
-    font-size: 12px; font-weight: 600;
-    color: #6B7AB8; margin-bottom: 8px;
-}
-.form-progress-bar {
-    height: 6px; background: #E0E7FF;
-    border-radius: 99px; overflow: hidden;
-}
-.form-progress-fill {
-    height: 100%; border-radius: 99px;
-    background: linear-gradient(90deg, #3B5BDB, #60A5FA);
-    transition: width 0.4s ease;
-}
-
-/* ── Section card ── */
-.form-section-card {
-    background: white;
-    border: 1.5px solid #E5E7EB;
-    border-radius: 14px;
-    padding: 24px 28px;
-    margin-bottom: 20px;
-    box-shadow: 0 1px 8px rgba(59,91,219,0.04);
-}
-.form-section-header {
-    display: flex; align-items: center; gap: 10px;
-    margin-bottom: 20px;
-    padding-bottom: 12px;
-    border-bottom: 1.5px solid #F3F4F6;
-}
-.form-section-icon  { font-size: 22px; }
-.form-section-title {
-    font-size: 14px; font-weight: 700;
-    color: #1E3A8A; letter-spacing: 0.02em;
-}
-.form-section-num {
-    margin-left: auto;
-    background: #EEF2FF; color: #3B5BDB;
-    font-size: 11px; font-weight: 700;
-    padding: 2px 10px; border-radius: 20px;
-}
-
-/* ── Symptom chip grid ── */
-.symptom-grid {
-    display: flex; flex-wrap: wrap; gap: 8px;
-    margin-bottom: 12px;
-}
-.symptom-chip {
-    display: inline-flex; align-items: center; gap: 6px;
-    background: #F0F4FF; border: 1.5px solid #C7D2FE;
-    color: #3B5BDB; border-radius: 8px;
-    font-size: 12px; font-weight: 500;
-    padding: 5px 12px; cursor: pointer;
-    transition: all 0.15s ease;
-}
-.symptom-chip.selected {
-    background: #3B5BDB; color: white;
-    border-color: #3B5BDB;
-}
-
-/* ── Vital input styling ── */
-div[data-testid="stNumberInput"] label,
-div[data-testid="stSelectbox"]  label,
-div[data-testid="stTextInput"]  label,
-div[data-testid="stSlider"]     label,
-div[data-testid="stTextArea"]   label {
-    font-size: 12px !important;
-    font-weight: 600 !important;
-    color: #374151 !important;
-}
-div[data-testid="stNumberInput"] input,
-div[data-testid="stTextInput"]   input {
-    border-radius: 8px !important;
-    border: 1.5px solid #D1D5DB !important;
-    font-size: 14px !important;
-    font-weight: 500 !important;
-}
-div[data-testid="stNumberInput"] input:focus,
-div[data-testid="stTextInput"]   input:focus {
-    border-color: #3B5BDB !important;
-    box-shadow: 0 0 0 3px rgba(59,91,219,0.1) !important;
-}
-
-/* ── Upload zone ── */
-.upload-zone {
-    border: 2px dashed #C7D2FE;
-    border-radius: 14px;
-    padding: 32px;
-    text-align: center;
-    background: #F8FAFF;
-    margin: 8px 0;
-}
-.upload-zone-icon  { font-size: 40px; margin-bottom: 8px; }
-.upload-zone-title { font-size: 14px; font-weight: 600; color: #3B5BDB; }
-.upload-zone-sub   { font-size: 12px; color: #9CA3AF; margin-top: 4px; }
-
-/* ── Vital reference row ── */
-.vital-ref-row {
-    background: #F0F9FF;
-    border: 1px solid #BAE6FD;
-    border-radius: 8px;
-    padding: 10px 14px;
-    font-size: 11px; color: #0369A1;
-    margin-top: 12px; line-height: 1.7;
-}
-
-/* ── Action buttons ── */
-.form-actions {
-    display: flex; gap: 12px; margin-top: 8px;
-}
-div[data-testid="stButton"] > button {
-    border-radius: 10px !important;
-    font-family: 'DM Sans', sans-serif !important;
-    font-size: 14px !important;
-    font-weight: 600 !important;
-    padding: 10px 24px !important;
-    transition: all 0.2s !important;
-}
-.primary-btn > div[data-testid="stButton"] > button {
-    background: linear-gradient(135deg,#3B5BDB,#2563EB) !important;
-    color: white !important; border: none !important;
-    box-shadow: 0 4px 14px rgba(59,91,219,0.3) !important;
-}
-
-/* ── Severity slider labels ── */
-.severity-label {
-    display: flex; justify-content: space-between;
-    font-size: 10px; color: #9CA3AF;
-    margin-top: -8px; margin-bottom: 8px;
-    padding: 0 4px;
-}
-
-/* ── Required asterisk ── */
-.required { color: #EF4444; margin-left: 2px; }
-
-/* ── Draft saved badge ── */
-.draft-badge {
-    display: inline-flex; align-items: center; gap: 6px;
-    background: #F0FDF4; border: 1px solid #86EFAC;
-    color: #15803D; border-radius: 20px;
-    font-size: 11px; font-weight: 600;
-    padding: 4px 12px;
-}
+    /* Form section */
+    .form-section {
+        background-color: #f8f9fa;
+        border-radius: 8px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+        border-left: 4px solid #1a73e8;
+    }
+    .form-section-title {
+        font-size: 1rem;
+        font-weight: 600;
+        color: #1a1a2e;
+        margin-bottom: 0.75rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    
+    /* Field error */
+    .field-error {
+        color: #e74c3c;
+        font-size: 0.75rem;
+        margin-top: 0.25rem;
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+    }
+    
+    /* Field valid */
+    .field-valid {
+        color: #2ecc71;
+        font-size: 0.75rem;
+        margin-top: 0.25rem;
+    }
+    
+    /* Validation summary */
+    .validation-summary {
+        background-color: #fff3cd;
+        border-left: 4px solid #ffc107;
+        padding: 0.75rem;
+        border-radius: 6px;
+        margin-bottom: 1rem;
+    }
+    .validation-error {
+        background-color: #f8d7da;
+        border-left: 4px solid #dc3545;
+    }
+    .validation-success {
+        background-color: #d4edda;
+        border-left: 4px solid #28a745;
+    }
+    
+    /* Help text */
+    .help-text {
+        color: #5f6368;
+        font-size: 0.75rem;
+        margin-top: 0.25rem;
+    }
 </style>
 """
 
 
-# ─────────────────────────────────────────────────────────────────
-# Constants (mirrors utils/constants.py — kept local for UI)
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Field Render Helpers
+# ─────────────────────────────────────────────
 
-SYMPTOMS_LIST = [
-    "Chest pain / tightness",
-    "Shortness of breath",
-    "Palpitations",
-    "Dizziness / lightheadedness",
-    "Fatigue / weakness",
-    "Leg / ankle swelling",
-    "Nausea / cold sweats",
-    "Arm / jaw pain",
-    "Syncope (fainting)",
-    "Cough (persistent)",
-    "Orthopnea (breathless lying flat)",
-    "No symptoms",
-]
-
-GENDER_OPTIONS    = ["Male", "Female", "Other", "Prefer not to say"]
-BLOOD_GROUPS      = ["A+", "A−", "B+", "B−", "AB+", "AB−", "O+", "O−", "Unknown"]
-SMOKING_OPTIONS   = ["Never smoked", "Former smoker", "Current smoker (< 10/day)",
-                     "Current smoker (≥ 10/day)"]
-DIABETES_OPTIONS  = ["None", "Type 1 Diabetes", "Type 2 Diabetes",
-                     "Pre-diabetic / IGT", "Gestational diabetes"]
-ACTIVITY_OPTIONS  = ["Sedentary", "Light (1–2 days/week)", "Moderate (3–5 days/week)",
-                     "Active (6–7 days/week)"]
-CHEST_PAIN_TYPES  = ["No chest pain", "Typical angina", "Atypical angina",
-                     "Non-anginal pain", "Asymptomatic"]
-ECG_OPTIONS       = ["Normal", "ST-T wave abnormality", "Left ventricular hypertrophy",
-                     "Not done"]
-
-
-# ─────────────────────────────────────────────────────────────────
-# Helper: calculate progress
-# ─────────────────────────────────────────────────────────────────
-
-def _calc_progress(ss: dict) -> int:
-    """Return 0–100 indicating how complete the form is."""
-    fields = [
-        ss.get("def_age"),
-        ss.get("def_gender"),
-        ss.get("def_symptoms"),
-        ss.get("def_bp_sys"),
-        ss.get("def_heart_rate"),
-        ss.get("def_cholesterol"),
-    ]
-    filled = sum(1 for f in fields if f)
-    return int((filled / len(fields)) * 100)
-
-
-# ─────────────────────────────────────────────────────────────────
-# Section renderers
-# ─────────────────────────────────────────────────────────────────
-
-def _section_personal() -> dict:
-    """Section 1 — Personal details."""
-    st.markdown("""
-    <div class="form-section-card">
-        <div class="form-section-header">
-            <span class="form-section-icon">👤</span>
-            <span class="form-section-title">Personal Information</span>
-            <span class="form-section-num">Section 1 / 5</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    with st.container():
-        c1, c2, c3 = st.columns([2, 1, 1])
-        with c1:
-            name = st.text_input(
-                "Full Name / Patient ID ✱",
-                placeholder="e.g. Rajveer Singh or P-00142",
-                key="def_name"
-            )
-        with c2:
-            age = st.number_input(
-                "Age (years) ✱", min_value=1, max_value=120,
-                value=None, placeholder="e.g. 52", key="def_age"
-            )
-        with c3:
-            gender = st.selectbox("Gender ✱", GENDER_OPTIONS, key="def_gender")
-
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            blood_group = st.selectbox("Blood Group", BLOOD_GROUPS, key="def_blood")
-        with c5:
-            dob = st.date_input(
-                "Date of Birth",
-                value=None,
-                min_value=date(1900, 1, 1),
-                max_value=date.today(),
-                key="def_dob"
-            )
-        with c6:
-            contact = st.text_input(
-                "Contact / Room No.",
-                placeholder="e.g. +91-9876543210",
-                key="def_contact"
-            )
-
-        notes = st.text_area(
-            "Clinical Notes (optional)",
-            placeholder="Add any additional context the doctor should know...",
-            height=80,
-            key="def_notes"
-        )
-
-    return {
-        "patient_name" : name,
-        "age"          : age,
-        "gender"       : gender,
-        "blood_group"  : blood_group,
-        "dob"          : str(dob) if dob else None,
-        "contact"      : contact,
-        "notes"        : notes,
-    }
-
-
-def _section_symptoms() -> dict:
-    """Section 2 — Symptom checklist with severity."""
-    st.markdown("""
-    <div class="form-section-card">
-        <div class="form-section-header">
-            <span class="form-section-icon">🩺</span>
-            <span class="form-section-title">Presenting Symptoms</span>
-            <span class="form-section-num">Section 2 / 5</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    symptoms = st.multiselect(
-        "Select all symptoms present ✱",
-        options=SYMPTOMS_LIST,
-        key="def_symptoms",
-        help="Select every symptom the patient reports"
+def _render_text_field(
+    label: str,
+    value: str,
+    key: str,
+    validator: callable,
+    placeholder: str = "",
+) -> Tuple[str, Optional[str]]:
+    """Render a text field with validation."""
+    new_value = st.text_input(
+        label,
+        value=value,
+        key=key,
+        placeholder=placeholder,
     )
+    
+    # Validate
+    if new_value:
+        is_valid, error = validator(new_value)
+        if not is_valid:
+            st.markdown(
+                f'<div class="field-error">⚠️ {error}</div>',
+                unsafe_allow_html=True,
+            )
+            return new_value, error
+        else:
+            st.markdown(
+                '<div class="field-valid">✓ Valid</div>',
+                unsafe_allow_html=True,
+            )
+    
+    return new_value, None
 
-    chest_pain_type = st.selectbox(
-        "Chest pain type (if applicable)",
-        options=CHEST_PAIN_TYPES,
-        key="def_cp_type"
+
+def _render_number_field(
+    label: str,
+    value: float,
+    key: str,
+    feature: str,
+    step: float = 1.0,
+) -> Tuple[float, Optional[str]]:
+    """Render a number field with range validation."""
+    min_val, max_val = FEATURE_RANGES.get(feature, (0, 1000))
+    
+    new_value = st.number_input(
+        label,
+        min_value=min_val,
+        max_value=max_val,
+        value=value,
+        key=key,
+        step=step,
     )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        symptom_duration = st.selectbox(
-            "Duration of main symptom",
-            ["< 24 hours", "1–3 days", "4–7 days",
-             "1–4 weeks", "> 1 month", "Chronic / ongoing", "Not applicable"],
-            key="def_duration"
-        )
-    with col2:
-        symptom_severity = st.slider(
-            "Overall symptom severity",
-            min_value=1, max_value=10, value=5,
-            key="def_severity"
-        )
+    
+    # Validate
+    is_valid, error = validate_single_field(feature, new_value)
+    if not is_valid:
         st.markdown(
-            '<div class="severity-label"><span>Mild (1)</span>'
-            '<span>Moderate (5)</span><span>Severe (10)</span></div>',
-            unsafe_allow_html=True
+            f'<div class="field-error">⚠️ {error}</div>',
+            unsafe_allow_html=True,
         )
+        return new_value, error
+    
+    return new_value, None
 
-    exercise_angina = st.checkbox(
-        "Symptoms worsen with physical exertion (exercise-induced angina)",
-        key="def_exang"
+
+def _render_select_field(
+    label: str,
+    value: int,
+    key: str,
+    feature: str,
+    options: Dict[int, str],
+) -> Tuple[int, Optional[str]]:
+    """Render a select field with validation."""
+    # Reverse mapping for display
+    value_to_label = {v: k for k, v in options.items()}
+    
+    selected_label = st.selectbox(
+        label,
+        options=list(options.values()),
+        index=list(options.values()).index(options.get(value, list(options.values())[0])),
+        key=key,
     )
+    
+    # Get numeric value
+    new_value = value_to_label[selected_label]
+    
+    # Validate
+    is_valid, error = validate_single_field(feature, new_value)
+    if not is_valid:
+        st.markdown(
+            f'<div class="field-error">⚠️ {error}</div>',
+            unsafe_allow_html=True,
+        )
+        return new_value, error
+    
+    return new_value, None
 
-    return {
-        "symptoms"        : symptoms,
-        "chest_pain_type" : chest_pain_type,
-        "symptom_duration": symptom_duration,
-        "symptom_severity": symptom_severity,
-        "exercise_angina" : exercise_angina,
-    }
+
+def _render_radio_field(
+    label: str,
+    value: int,
+    key: str,
+    feature: str,
+    options: Dict[int, str],
+    horizontal: bool = True,
+) -> Tuple[int, Optional[str]]:
+    """Render a radio field with validation."""
+    value_to_label = {v: k for k, v in options.items()}
+    
+    selected_label = st.radio(
+        label,
+        options=list(options.values()),
+        index=list(options.values()).index(options.get(value, list(options.values())[0])),
+        key=key,
+        horizontal=horizontal,
+    )
+    
+    new_value = value_to_label[selected_label]
+    
+    is_valid, error = validate_single_field(feature, new_value)
+    if not is_valid:
+        st.markdown(
+            f'<div class="field-error">⚠️ {error}</div>',
+            unsafe_allow_html=True,
+        )
+        return new_value, error
+    
+    return new_value, None
 
 
-def _section_vitals() -> dict:
-    """Section 3 — Vitals with normal range references."""
-    st.markdown("""
-    <div class="form-section-card">
-        <div class="form-section-header">
-            <span class="form-section-icon">📊</span>
-            <span class="form-section-title">Vitals & Lab Values</span>
-            <span class="form-section-num">Section 3 / 5</span>
+# ─────────────────────────────────────────────
+# Section Renderers
+# ─────────────────────────────────────────────
+
+def _render_demographics_section(
+    form_data: Dict[str, Any],
+    errors: Dict[str, str],
+    form_key: str,
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Render patient demographics section."""
+    st.markdown(
+        """
+        <div class="form-section">
+            <div class="form-section-title">👤 Patient Demographics</div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    # Name
+    name, name_err = _render_text_field(
+        "Patient Name",
+        form_data.get("name", ""),
+        f"{form_key}_name",
+        validate_patient_name,
+        placeholder="Enter full name",
+    )
+    form_data["name"] = name
+    if name_err:
+        errors["name"] = name_err
+    else:
+        errors.pop("name", None)
+    
+    # Age and Sex in columns
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        age, age_err = _render_number_field(
+            "Age (years)",
+            form_data.get("age", 50),
+            f"{form_key}_age",
+            "age",
+            step=1,
+        )
+        form_data["age"] = int(age)
+        if age_err:
+            errors["age"] = age_err
+        else:
+            errors.pop("age", None)
+    
+    with col2:
+        sex, sex_err = _render_radio_field(
+            "Sex",
+            form_data.get("sex", 1),
+            f"{form_key}_sex",
+            "sex",
+            {0: "Female", 1: "Male"},
+        )
+        form_data["sex"] = sex
+        if sex_err:
+            errors["sex"] = sex_err
+        else:
+            errors.pop("sex", None)
+    
+    return form_data, errors
 
-    # Blood Pressure
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        bp_sys = st.number_input(
-            "Systolic BP (mmHg) ✱",
-            min_value=60, max_value=250,
-            value=None, placeholder="e.g. 128",
-            key="def_bp_sys"
-        )
-    with c2:
-        bp_dia = st.number_input(
-            "Diastolic BP (mmHg) ✱",
-            min_value=40, max_value=150,
-            value=None, placeholder="e.g. 84",
-            key="def_bp_dia"
-        )
-    with c3:
-        heart_rate = st.number_input(
-            "Heart Rate (bpm) ✱",
-            min_value=30, max_value=220,
-            value=None, placeholder="e.g. 78",
-            key="def_heart_rate"
-        )
 
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        cholesterol = st.number_input(
-            "Total Cholesterol (mg/dL) ✱",
-            min_value=50, max_value=700,
-            value=None, placeholder="e.g. 210",
-            key="def_cholesterol"
+def _render_vitals_section(
+    form_data: Dict[str, Any],
+    errors: Dict[str, str],
+    form_key: str,
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Render vital signs section."""
+    st.markdown(
+        """
+        <div class="form-section">
+            <div class="form-section-title">💓 Vital Signs</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Resting BP
+        trestbps, err = _render_number_field(
+            "Resting BP (mm Hg)",
+            form_data.get("trestbps", 120),
+            f"{form_key}_trestbps",
+            "trestbps",
+            step=1,
         )
-    with c5:
-        glucose = st.number_input(
-            "Fasting Glucose (mg/dL)",
-            min_value=50, max_value=600,
-            value=None, placeholder="e.g. 100",
-            key="def_glucose"
+        form_data["trestbps"] = int(trestbps)
+        if err:
+            errors["trestbps"] = err
+        else:
+            errors.pop("trestbps", None)
+        
+        # Cholesterol
+        chol, err = _render_number_field(
+            "Cholesterol (mg/dl)",
+            form_data.get("chol", 200),
+            f"{form_key}_chol",
+            "chol",
+            step=1,
         )
-    with c6:
-        max_hr = st.number_input(
-            "Max HR Achieved (exercise test)",
-            min_value=50, max_value=250,
-            value=None, placeholder="e.g. 150",
-            key="def_thalach"
+        form_data["chol"] = int(chol)
+        if err:
+            errors["chol"] = err
+        else:
+            errors.pop("chol", None)
+    
+    with col2:
+        # Max Heart Rate
+        thalach, err = _render_number_field(
+            "Max Heart Rate (bpm)",
+            form_data.get("thalach", 150),
+            f"{form_key}_thalach",
+            "thalach",
+            step=1,
         )
+        form_data["thalach"] = int(thalach)
+        if err:
+            errors["thalach"] = err
+        else:
+            errors.pop("thalach", None)
+        
+        # Fasting Blood Sugar
+        fbs, err = _render_select_field(
+            "Fasting Blood Sugar > 120 mg/dl",
+            form_data.get("fbs", 0),
+            f"{form_key}_fbs",
+            "fbs",
+            {0: "No", 1: "Yes"},
+        )
+        form_data["fbs"] = fbs
+        if err:
+            errors["fbs"] = err
+        else:
+            errors.pop("fbs", None)
+    
+    return form_data, errors
 
-    c7, c8 = st.columns(2)
-    with c7:
-        st_depression = st.number_input(
+
+def _render_clinical_section(
+    form_data: Dict[str, Any],
+    errors: Dict[str, str],
+    form_key: str,
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Render clinical findings section."""
+    st.markdown(
+        """
+        <div class="form-section">
+            <div class="form-section-title">🩺 Clinical Findings</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    # Chest Pain Type
+    cp, err = _render_select_field(
+        "Chest Pain Type",
+        form_data.get("cp", 0),
+        f"{form_key}_cp",
+        "cp",
+        CHEST_PAIN_LABELS,
+    )
+    form_data["cp"] = cp
+    if err:
+        errors["cp"] = err
+    else:
+        errors.pop("cp", None)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Resting ECG
+        restecg, err = _render_select_field(
+            "Resting ECG",
+            form_data.get("restecg", 0),
+            f"{form_key}_restecg",
+            "restecg",
+            RESTECG_LABELS,
+        )
+        form_data["restecg"] = restecg
+        if err:
+            errors["restecg"] = err
+        else:
+            errors.pop("restecg", None)
+        
+        # Exercise Angina
+        exang, err = _render_select_field(
+            "Exercise-Induced Angina",
+            form_data.get("exang", 0),
+            f"{form_key}_exang",
+            "exang",
+            {0: "No", 1: "Yes"},
+        )
+        form_data["exang"] = exang
+        if err:
+            errors["exang"] = err
+        else:
+            errors.pop("exang", None)
+    
+    with col2:
+        # ST Depression
+        oldpeak, err = _render_number_field(
             "ST Depression (oldpeak)",
-            min_value=0.0, max_value=10.0,
-            value=0.0, step=0.1,
-            key="def_oldpeak",
-            help="ST depression induced by exercise relative to rest"
+            form_data.get("oldpeak", 0.0),
+            f"{form_key}_oldpeak",
+            "oldpeak",
+            step=0.1,
         )
-    with c8:
-        st_slope = st.selectbox(
+        form_data["oldpeak"] = float(oldpeak)
+        if err:
+            errors["oldpeak"] = err
+        else:
+            errors.pop("oldpeak", None)
+        
+        # ST Slope
+        slope, err = _render_select_field(
             "ST Slope",
-            ["Upsloping", "Flat", "Downsloping"],
-            key="def_slope"
+            form_data.get("slope", 0),
+            f"{form_key}_slope",
+            "slope",
+            SLOPE_LABELS,
         )
-
-    # Quick reference
-    st.markdown("""
-    <div class="vital-ref-row">
-        📌 <strong>Normal ranges:</strong>
-        BP 90–120 / 60–80 mmHg &nbsp;·&nbsp;
-        HR 60–100 bpm &nbsp;·&nbsp;
-        Total Cholesterol &lt; 200 mg/dL &nbsp;·&nbsp;
-        Fasting Glucose 70–100 mg/dL
-    </div>
-    """, unsafe_allow_html=True)
-
-    return {
-        "bp_systolic"  : bp_sys,
-        "bp_diastolic" : bp_dia,
-        "heart_rate"   : heart_rate,
-        "cholesterol"  : cholesterol,
-        "glucose"      : glucose,
-        "thalach"      : max_hr,
-        "oldpeak"      : st_depression,
-        "slope"        : st_slope,
-    }
+        form_data["slope"] = slope
+        if err:
+            errors["slope"] = err
+        else:
+            errors.pop("slope", None)
+    
+    return form_data, errors
 
 
-def _section_history() -> dict:
-    """Section 4 — Medical history and risk factors."""
-    st.markdown("""
-    <div class="form-section-card">
-        <div class="form-section-header">
-            <span class="form-section-icon">📋</span>
-            <span class="form-section-title">Medical History & Risk Factors</span>
-            <span class="form-section-num">Section 4 / 5</span>
+def _render_test_results_section(
+    form_data: Dict[str, Any],
+    errors: Dict[str, str],
+    form_key: str,
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Render test results section."""
+    st.markdown(
+        """
+        <div class="form-section">
+            <div class="form-section-title">🔬 Test Results</div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        smoking  = st.selectbox("Smoking status", SMOKING_OPTIONS, key="def_smoking")
-        diabetes = st.selectbox("Diabetes status", DIABETES_OPTIONS, key="def_diabetes")
-    with c2:
-        activity  = st.selectbox("Physical activity", ACTIVITY_OPTIONS, key="def_activity")
-        ecg       = st.selectbox("Resting ECG", ECG_OPTIONS, key="def_restecg")
-    with c3:
-        vessels = st.selectbox(
-            "Major vessels coloured (fluoroscopy)",
-            ["0", "1", "2", "3", "Not done"],
-            key="def_ca"
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Major Vessels
+        ca, err = _render_select_field(
+            "Major Vessels (Fluoroscopy)",
+            form_data.get("ca", 0),
+            f"{form_key}_ca",
+            "ca",
+            {0: "0", 1: "1", 2: "2", 3: "3"},
         )
-        thal = st.selectbox(
+        form_data["ca"] = ca
+        if err:
+            errors["ca"] = err
+        else:
+            errors.pop("ca", None)
+    
+    with col2:
+        # Thalassemia
+        thal, err = _render_select_field(
             "Thalassemia",
-            ["Normal", "Fixed defect", "Reversible defect", "Not tested"],
-            key="def_thal"
+            form_data.get("thal", 1),
+            f"{form_key}_thal",
+            "thal",
+            THAL_LABELS,
         )
-
-    st.markdown("**Comorbidities** — check all that apply")
-    ch1, ch2, ch3, ch4 = st.columns(4)
-    with ch1:
-        hypertension   = st.checkbox("Hypertension",     key="def_htn")
-        prev_mi        = st.checkbox("Previous MI",       key="def_prev_mi")
-    with ch2:
-        heart_failure  = st.checkbox("Heart failure",     key="def_hf")
-        stroke         = st.checkbox("Prior stroke/TIA",  key="def_stroke")
-    with ch3:
-        family_history = st.checkbox("Family hx of CAD", key="def_fam")
-        obesity        = st.checkbox("Obesity (BMI>30)",  key="def_obesity")
-    with ch4:
-        ckd            = st.checkbox("Chronic kidney dis.",key="def_ckd")
-        hyperlipidemia = st.checkbox("Hyperlipidemia",    key="def_hl")
-
-    current_meds = st.text_area(
-        "Current Medications (comma-separated)",
-        placeholder="e.g. Metoprolol 50mg, Aspirin 75mg, Atorvastatin 20mg",
-        height=70, key="def_meds"
+        form_data["thal"] = thal
+        if err:
+            errors["thal"] = err
+        else:
+            errors.pop("thal", None)
+    
+    # Symptoms (optional)
+    symptoms = st.text_area(
+        "Symptoms (optional)",
+        value=form_data.get("symptoms", ""),
+        key=f"{form_key}_symptoms",
+        placeholder="Describe any symptoms or clinical notes...",
+        height=80,
     )
-    allergies = st.text_input(
-        "Known Drug Allergies",
-        placeholder="e.g. Penicillin, Sulfa drugs",
-        key="def_allergies"
-    )
-
-    return {
-        "smoking"        : smoking,
-        "diabetes"       : diabetes,
-        "activity"       : activity,
-        "ecg"            : ecg,
-        "vessels"        : int(vessels) if vessels.isdigit() else 0,
-        "thal"           : thal,
-        "hypertension"   : hypertension,
-        "prev_mi"        : prev_mi,
-        "heart_failure"  : heart_failure,
-        "stroke"         : stroke,
-        "family_history" : family_history,
-        "obesity"        : obesity,
-        "ckd"            : ckd,
-        "hyperlipidemia" : hyperlipidemia,
-        "medications"    : current_meds,
-        "allergies"      : allergies,
-    }
+    form_data["symptoms"] = symptoms
+    
+    return form_data, errors
 
 
-def _section_upload() -> dict:
-    """Section 5 — Medical report upload."""
-    st.markdown("""
-    <div class="form-section-card">
-        <div class="form-section-header">
-            <span class="form-section-icon">📎</span>
-            <span class="form-section-title">Medical Reports & Documents</span>
-            <span class="form-section-num">Section 5 / 5</span>
+def _render_validation_summary(errors: Dict[str, str]) -> bool:
+    """Render validation summary and return if form is valid."""
+    if not errors:
+        st.markdown(
+            """
+            <div class="validation-summary validation-success">
+                ✓ All fields are valid. Ready to submit.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return True
+    
+    st.markdown(
+        f"""
+        <div class="validation-summary validation-error">
+            ⚠️ Please correct the following errors:
+            <br>{errors_to_str(errors).replace(chr(10), '<br>')}
         </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="upload-zone">
-        <div class="upload-zone-icon">📄</div>
-        <div class="upload-zone-title">Upload medical reports</div>
-        <div class="upload-zone-sub">ECG strips, echo reports, lab reports — PDF or image</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    uploaded_files = st.file_uploader(
-        "Select files",
-        type=["pdf", "png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        key="def_reports",
-        label_visibility="collapsed"
+        """,
+        unsafe_allow_html=True,
     )
-
-    report_type = st.selectbox(
-        "Primary report type uploaded",
-        ["None", "ECG / EKG", "Echocardiogram",
-         "Stress Test", "Lab Report", "Angiogram", "Other"],
-        key="def_report_type"
-    )
-
-    file_names = [f.name for f in uploaded_files] if uploaded_files else []
-
-    if file_names:
-        st.success(f"✅ {len(file_names)} file(s) attached: {', '.join(file_names)}")
-
-    return {
-        "report_files" : file_names,
-        "report_type"  : report_type,
-    }
+    return False
 
 
-# ─────────────────────────────────────────────────────────────────
-# Main render
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Main Render Function
+# ─────────────────────────────────────────────
 
-def render_data_entry_form() -> dict | None:
+def render_data_entry_form(
+    form_key: str = "patient_form",
+    initial_data: Optional[Dict[str, Any]] = None,
+    show_submit: bool = True,
+    user_role: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Render the full structured patient data entry form.
+    Render the complete patient data entry form.
+
+    Parameters
+    ----------
+    form_key     : str — unique key for session state
+    initial_data : dict — initial form values (optional)
+    show_submit  : bool — whether to show submit button
+    user_role    : str — current user role for permission checks
 
     Returns
     -------
-    dict | None
-        Complete patient record when submitted and validated.
-        None if not yet submitted or validation fails.
+    dict with form state:
+        {
+            "data": dict,
+            "errors": dict,
+            "is_valid": bool,
+            "submitted": bool,
+        }
     """
-    st.markdown(DATA_ENTRY_CSS, unsafe_allow_html=True)
-
-    # Header
-    st.markdown("""
-    <div class="form-page-header">
-        <div class="form-page-icon">📝</div>
-        <div>
-            <div class="form-page-title">New Patient Entry</div>
-            <div class="form-page-sub">
-                Fill all sections marked ✱ before submitting for AI analysis
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Progress bar (reads from session_state)
-    progress = _calc_progress(st.session_state)
-    st.markdown(f"""
-    <div class="form-progress-wrap">
-        <div class="form-progress-label">
-            <span>Form completion</span>
-            <span>{progress}%</span>
-        </div>
-        <div class="form-progress-bar">
-            <div class="form-progress-fill" style="width:{progress}%"></div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Collect all sections ─────────────────────────────────────
-    personal = _section_personal()
-    symptoms = _section_symptoms()
-    vitals   = _section_vitals()
-    history  = _section_history()
-    uploads  = _section_upload()
-
-    # ── Action buttons ───────────────────────────────────────────
-    st.markdown("<br>", unsafe_allow_html=True)
-    col_save, col_submit, col_clear = st.columns([1, 1, 0.5])
-
-    with col_save:
-        if st.button("💾 Save as Draft", use_container_width=True):
-            st.session_state["draft_patient"] = {
-                **personal, **symptoms, **vitals, **history, **uploads
+    # Inject CSS
+    st.markdown(FORM_CSS, unsafe_allow_html=True)
+    
+    # Initialize session state
+    state_key = f"{form_key}_state"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = {
+            "data": initial_data or {},
+            "errors": {},
+            "submitted": False,
+        }
+    
+    state = st.session_state[state_key]
+    form_data = state["data"]
+    errors = state["errors"]
+    
+    # Load sample button
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("📋 Load Sample", key=f"{form_key}_load_sample"):
+            sample = load_sample_input()
+            if sample:
+                st.session_state[state_key]["data"] = sample
+                st.session_state[state_key]["errors"] = {}
+                st.rerun()
+    
+    with col2:
+        if st.button("🗑️ Clear Form", key=f"{form_key}_clear"):
+            st.session_state[state_key] = {
+                "data": {},
+                "errors": {},
+                "submitted": False,
             }
-            st.markdown(
-                '<div class="draft-badge">✓ Draft saved successfully</div>',
-                unsafe_allow_html=True
-            )
-
-    with col_submit:
-        submitted = st.button(
-            "🔍 Submit for AI Analysis",
-            use_container_width=True,
-            type="primary"
-        )
-
-    with col_clear:
-        if st.button("🗑 Clear", use_container_width=True):
-            for key in list(st.session_state.keys()):
-                if key.startswith("def_"):
-                    del st.session_state[key]
             st.rerun()
-
-    # ── Validation on submit ─────────────────────────────────────
-    if not submitted:
-        return None
-
-    errors = []
-    if not personal.get("age"):
-        errors.append("Age is required.")
-    if not personal.get("gender"):
-        errors.append("Gender is required.")
-    if not symptoms.get("symptoms"):
-        errors.append("At least one symptom must be selected.")
-    if not vitals.get("bp_systolic"):
-        errors.append("Systolic BP is required.")
-    if not vitals.get("heart_rate"):
-        errors.append("Heart rate is required.")
-    if not vitals.get("cholesterol"):
-        errors.append("Cholesterol is required.")
-    if (vitals.get("bp_systolic") and vitals.get("bp_diastolic") and
-            vitals["bp_systolic"] <= vitals["bp_diastolic"]):
-        errors.append("Systolic BP must be greater than Diastolic BP.")
-
-    if errors:
-        for err in errors:
-            st.error(f"⚠️ {err}")
-        return None
-
-    # ── Merge all sections into one record ───────────────────────
-    patient_record = {
-        **personal,
-        **symptoms,
-        **vitals,
-        **history,
-        **uploads,
-        "submitted_at": datetime.now().isoformat(),
-        "is_online"   : st.session_state.get("is_online", False),
+    
+    st.markdown("---")
+    
+    # Render sections
+    form_data, errors = _render_demographics_section(form_data, errors, form_key)
+    form_data, errors = _render_vitals_section(form_data, errors, form_key)
+    form_data, errors = _render_clinical_section(form_data, errors, form_key)
+    form_data, errors = _render_test_results_section(form_data, errors, form_key)
+    
+    # Update state
+    state["data"] = form_data
+    state["errors"] = errors
+    
+    # Validation summary
+    is_valid = _render_validation_summary(errors)
+    
+    # Submit button
+    submitted = False
+    if show_submit:
+        can_submit = (
+            user_has_permission({"role": user_role}, "enter_vitals")
+            if user_role else True
+        )
+        
+        if st.button(
+            "🔍 Analyze Patient",
+            key=f"{form_key}_submit",
+            use_container_width=True,
+            type="primary",
+            disabled=not is_valid or not can_submit,
+        ):
+            if is_valid and can_submit:
+                state["submitted"] = True
+                submitted = True
+                st.toast("✅ Form submitted successfully", icon="✅")
+            elif not can_submit:
+                st.toast("⚠️ You don't have permission to submit", icon="⚠️")
+    
+    # Preview expander
+    with st.expander("👁️ Preview Form Data", expanded=False):
+        display_data = patient_to_display(form_data)
+        for label, value in display_data.items():
+            st.markdown(f"**{label}**: {value}")
+    
+    return {
+        "data": form_data,
+        "errors": errors,
+        "is_valid": is_valid,
+        "submitted": submitted,
     }
 
-    return patient_record
+
+def get_form_data(form_key: str = "patient_form") -> Optional[Dict[str, Any]]:
+    """
+    Get current form data from session state.
+    Returns None if form not initialized.
+    """
+    state_key = f"{form_key}_state"
+    if state_key in st.session_state:
+        return st.session_state[state_key].get("data")
+    return None
+
+
+def set_form_data(form_key: str, data: Dict[str, Any]) -> None:
+    """
+    Set form data in session state.
+    """
+    state_key = f"{form_key}_state"
+    if state_key in st.session_state:
+        st.session_state[state_key]["data"] = data
+        st.session_state[state_key]["errors"] = {}
+    else:
+        st.session_state[state_key] = {
+            "data": data,
+            "errors": {},
+            "submitted": False,
+        }
+
+
+def reset_form(form_key: str = "patient_form") -> None:
+    """
+    Reset form to empty state.
+    """
+    state_key = f"{form_key}_state"
+    st.session_state[state_key] = {
+        "data": {},
+        "errors": {},
+        "submitted": False,
+    }

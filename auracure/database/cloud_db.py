@@ -1,542 +1,412 @@
-"""
-database/cloud_db.py
-────────────────────
-Firebase Firestore cloud database for AuraEcho+.
+# =============================================================================
+# database/cloud_db.py
+# AuraEcho+ — Cloud Database Engine (Firebase Firestore)
+#
+# Responsibility:
+#     Manage cloud persistence and synchronization with Firebase Firestore.
+#     Provides batch push operations for the sync service.
+#     Supports graceful degradation if Firebase is not configured.
+#
+# Public API:
+#     init_cloud_db()               → bool
+#     is_cloud_available()          → bool
+#     push_patient(patient)         → str (doc_id)
+#     push_prediction(prediction)   → str (doc_id)
+#     batch_push(records)           → int (success_count)
+#     get_cloud_status()            → dict
+#     verify_connection()           → bool
+# =============================================================================
 
-Responsibility:
-    Push patient records and assessments to Firebase Firestore when
-    the system is online.  Acts as the cloud mirror of local_db.py —
-    same data structure, different storage backend.
-
-Why Firebase?
-    - Real-time sync across devices (doctor's tablet + nurse's laptop)
-    - Offline SDK support (Firebase caches writes when offline)
-    - Simple NoSQL document model that matches our patient dict structure
-    - Free tier sufficient for clinic-scale usage
-
-Architecture:
-    local_db.py  →  sync_service.py  →  cloud_db.py  →  Firestore
-                    (on reconnect)
-
-Collections:
-    /patients/{patient_id}          — patient demographic + clinical data
-    /assessments/{assessment_id}    — risk scores + AI diagnosis results
-
-Public API:
-    push_patient(patient_dict)              → bool
-    push_assessment(assessment_dict)        → bool
-    fetch_patient(patient_id)               → dict | None
-    fetch_all_patients(limit)               → List[dict]
-    fetch_assessments(patient_id)           → List[dict]
-    is_firebase_available()                 → bool
-    get_firebase_status()                   → dict
-    batch_push(patients, assessments)       → SyncResult
-"""
-
-import json
 import os
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+import json
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 
-from utils.constants import (
-    FIREBASE_PATIENTS_COLLECTION,
-    FIREBASE_ASSESSMENTS_COLLECTION,
-    FIREBASE_PROJECT_ID,
-)
-from utils.helpers import get_logger
-
-logger = get_logger(__name__)
-
-# ─────────────────────────────────────────────
-# Optional Firebase import
-# ─────────────────────────────────────────────
 try:
     import firebase_admin
     from firebase_admin import credentials, firestore
-    FIREBASE_SDK_AVAILABLE = True
+    FIREBASE_AVAILABLE = True
 except ImportError:
-    FIREBASE_SDK_AVAILABLE = False
-    logger.warning(
-        "firebase-admin not installed — cloud sync disabled. "
-        "Install with: pip install firebase-admin"
-    )
+    FIREBASE_AVAILABLE = False
+    firestore = None
+    firebase_admin = None
+
+from utils.constants import (
+    FIREBASE_COLLECTION,
+    DB_TABLE_PATIENTS,
+    DB_TABLE_PREDICTIONS,
+    SYNC_BATCH_SIZE,
+)
+from utils.helpers import get_logger, now_str, mask_key
+
+logger = get_logger(__name__)
+
+# Module-level state
+_db_client: Optional[Any] = None
+_initialized: bool = False
+_init_error: str = ""
+
 
 # ─────────────────────────────────────────────
-# Firebase app singleton
+# Initialization
 # ─────────────────────────────────────────────
-_firebase_app  = None
-_firestore_db  = None
 
-
-def _init_firebase() -> bool:
+def init_cloud_db() -> bool:
     """
-    Initialise the Firebase Admin SDK.
+    Initialize Firebase connection.
+    Looks for GOOGLE_APPLICATION_CREDENTIALS env var or service account JSON.
+    Returns True if initialized successfully, False otherwise.
+    """
+    global _db_client, _initialized, _init_error
 
-    Looks for credentials in this priority order:
-    1. FIREBASE_CREDENTIALS_JSON env var (JSON string — for cloud deployment)
-    2. FIREBASE_CREDENTIALS_PATH env var (path to service-account JSON file)
-    3. data/firebase_credentials.json (local development fallback)
+    if _initialized:
+        return _db_client is not None
+
+    if not FIREBASE_AVAILABLE:
+        _init_error = "firebase_admin not installed — pip install firebase-admin"
+        logger.warning(_init_error)
+        _initialized = True
+        return False
+
+    try:
+        # Check for credentials
+        cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        cred_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+
+        if cred_path and os.path.exists(cred_path):
+            cred = credentials.Certificate(cred_path)
+            logger.info(
+                "Firebase credentials loaded from file: %s",
+                mask_key(cred_path, visible=10),
+            )
+        elif cred_json:
+            cred_dict = json.loads(cred_json)
+            cred = credentials.Certificate(cred_dict)
+            logger.info("Firebase credentials loaded from JSON env var")
+        else:
+            _init_error = (
+                "No Firebase credentials found. Set GOOGLE_APPLICATION_CREDENTIALS "
+                "or FIREBASE_SERVICE_ACCOUNT_JSON environment variable."
+            )
+            logger.warning(_init_error)
+            _initialized = True
+            return False
+
+        # Initialize app
+        firebase_admin.initialize_app(cred)
+        _db_client = firestore.client()
+        _initialized = True
+        logger.info("Firebase Firestore client initialized successfully")
+        return True
+
+    except Exception as exc:
+        _init_error = f"Firebase init failed: {exc}"
+        logger.error(_init_error)
+        _initialized = True
+        return False
+
+
+def is_cloud_available() -> bool:
+    """
+    Check if cloud database is available and initialized.
+    """
+    return init_cloud_db() and _db_client is not None
+
+
+# ─────────────────────────────────────────────
+# Internal helpers
+# ─────────────────────────────────────────────
+
+def _get_collection() -> Optional[Any]:
+    """Get the Firestore collection reference."""
+    if not is_cloud_available():
+        return None
+    return _db_client.collection(FIREBASE_COLLECTION)
+
+
+def _prepare_record(
+    table: str,
+    record: Dict[str, Any],
+    local_id: int,
+) -> Dict[str, Any]:
+    """
+    Prepare a local record for cloud storage.
+    Adds metadata fields for sync tracking.
+    """
+    now = now_str()
+    cloud_record = {
+        **record,
+        "_meta": {
+            "local_id": local_id,
+            "local_table": table,
+            "synced_at": now,
+            "source": "auraecho_local",
+        },
+    }
+    # Ensure timestamps are strings
+    for key in ["created_at", "updated_at", "synced_at"]:
+        if key in cloud_record and isinstance(cloud_record[key], datetime):
+            cloud_record[key] = cloud_record[key].isoformat()
+    return cloud_record
+
+
+# ─────────────────────────────────────────────
+# Push operations
+# ─────────────────────────────────────────────
+
+def push_patient(patient: Dict[str, Any]) -> Optional[str]:
+    """
+    Push a patient record to Firestore.
+
+    Parameters
+    ----------
+    patient : dict with 'id' key (local patient ID)
 
     Returns
     -------
-    True if Firebase was successfully initialised, False otherwise.
+    doc_id : str or None if failed
     """
-    global _firebase_app, _firestore_db
+    coll = _get_collection()
+    if coll is None:
+        logger.warning("Cannot push patient — cloud unavailable")
+        return None
 
-    if _firestore_db is not None:
-        return True   # already initialised
-
-    if not FIREBASE_SDK_AVAILABLE:
-        logger.warning("Firebase SDK not available")
-        return False
-
-    # Already initialised by another call
     try:
-        existing = firebase_admin.get_app()
-        _firebase_app = existing
-        _firestore_db = firestore.client()
-        return True
-    except ValueError:
-        pass   # No app initialised yet — proceed below
+        local_id = patient.get("id")
+        if not local_id:
+            logger.error("Patient missing 'id' field")
+            return None
 
-    # ── Locate credentials ──────────────────────────────────────────
-    cred_obj = None
+        cloud_record = _prepare_record(DB_TABLE_PATIENTS, patient, local_id)
+        doc_ref = coll.document(f"patient_{local_id}")
+        doc_ref.set(cloud_record)
 
-    # Option 1: JSON string in environment (for deployment)
-    cred_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON", "")
-    if cred_json_str:
-        try:
-            cred_dict = json.loads(cred_json_str)
-            cred_obj  = credentials.Certificate(cred_dict)
-            logger.info("Firebase: using credentials from FIREBASE_CREDENTIALS_JSON env var")
-        except (json.JSONDecodeError, Exception) as exc:
-            logger.error("Failed to parse FIREBASE_CREDENTIALS_JSON: %s", exc)
+        logger.info("Pushed patient local_id=%d → doc_id=%s", local_id, doc_ref.id)
+        return doc_ref.id
 
-    # Option 2: Path to JSON file
-    if cred_obj is None:
-        cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "data/firebase_credentials.json")
-        if os.path.exists(cred_path):
+    except Exception as exc:
+        logger.error("Failed to push patient local_id=%d: %s", local_id, exc)
+        return None
+
+
+def push_prediction(prediction: Dict[str, Any]) -> Optional[str]:
+    """
+    Push a prediction record to Firestore.
+
+    Parameters
+    ----------
+    prediction : dict with 'id' key (local prediction ID)
+
+    Returns
+    -------
+    doc_id : str or None if failed
+    """
+    coll = _get_collection()
+    if coll is None:
+        logger.warning("Cannot push prediction — cloud unavailable")
+        return None
+
+    try:
+        local_id = prediction.get("id")
+        if not local_id:
+            logger.error("Prediction missing 'id' field")
+            return None
+
+        cloud_record = _prepare_record(DB_TABLE_PREDICTIONS, prediction, local_id)
+        doc_ref = coll.document(f"prediction_{local_id}")
+        doc_ref.set(cloud_record)
+
+        logger.info(
+            "Pushed prediction local_id=%d → doc_id=%s",
+            local_id, doc_ref.id,
+        )
+        return doc_ref.id
+
+    except Exception as exc:
+        logger.error("Failed to push prediction local_id=%d: %s", local_id, exc)
+        return None
+
+
+def batch_push(records: List[Dict[str, Any]]) -> int:
+    """
+    Push multiple records to Firestore in a batch.
+    Each record must have: 'table', 'id', and 'data' keys.
+
+    Parameters
+    ----------
+    records : list of {
+        'table': 'patients' | 'predictions',
+        'id': int,
+        'data': dict
+    }
+
+    Returns
+    -------
+    success_count : int
+    """
+    coll = _get_collection()
+    if coll is None:
+        logger.warning("Cannot batch push — cloud unavailable")
+        return 0
+
+    if not records:
+        return 0
+
+    # Firestore batch limit is 500 operations
+    batch_size = min(SYNC_BATCH_SIZE, 500)
+    success_count = 0
+
+    for i in range(0, len(records), batch_size):
+        batch_records = records[i : i + batch_size]
+        batch = _db_client.batch()
+        batch_success = 0
+
+        for rec in batch_records:
             try:
-                cred_obj = credentials.Certificate(cred_path)
-                logger.info("Firebase: using credentials from %s", cred_path)
+                table = rec.get("table")
+                local_id = rec.get("id")
+                data = rec.get("data", {})
+
+                if not table or not local_id:
+                    logger.warning("Invalid record format: %s", rec)
+                    continue
+
+                cloud_record = _prepare_record(table, data, local_id)
+                doc_id = f"{table.rstrip('s')}_{local_id}"
+                doc_ref = coll.document(doc_id)
+                batch.set(doc_ref, cloud_record)
+                batch_success += 1
+
             except Exception as exc:
-                logger.error("Failed to load Firebase credentials from %s: %s", cred_path, exc)
+                logger.error("Error preparing record for batch: %s", exc)
+                continue
 
-    if cred_obj is None:
-        logger.warning(
-            "No Firebase credentials found. "
-            "Set FIREBASE_CREDENTIALS_JSON or FIREBASE_CREDENTIALS_PATH, "
-            "or place data/firebase_credentials.json in the project root."
-        )
-        return False
+        try:
+            batch.commit()
+            success_count += batch_success
+            logger.info(
+                "Batch push committed: %d/%d records",
+                batch_success, len(batch_records),
+            )
+        except Exception as exc:
+            logger.error("Batch commit failed: %s", exc)
+            # Batch is atomic — if commit fails, none are written
 
-    # ── Initialise app ──────────────────────────────────────────────
-    try:
-        project_id = os.getenv("FIREBASE_PROJECT_ID", FIREBASE_PROJECT_ID)
-        _firebase_app = firebase_admin.initialize_app(
-            cred_obj,
-            options={"projectId": project_id} if project_id else {},
-        )
-        _firestore_db = firestore.client()
-        logger.info("Firebase initialised successfully (project=%s)", project_id)
-        return True
-    except Exception as exc:
-        logger.error("Firebase initialisation failed: %s", exc)
-        return False
-
-
-def _get_db():
-    """
-    Return the Firestore client, initialising Firebase if needed.
-    Returns None if Firebase is unavailable.
-    """
-    if _firestore_db is not None:
-        return _firestore_db
-    success = _init_firebase()
-    return _firestore_db if success else None
+    logger.info("Total batch push: %d/%d records succeeded", success_count, len(records))
+    return success_count
 
 
 # ─────────────────────────────────────────────
-# Status checks
+# Status / Health checks
 # ─────────────────────────────────────────────
 
-def is_firebase_available() -> bool:
+def verify_connection() -> bool:
     """
-    Return True if Firebase is configured and reachable.
+    Verify cloud connection by performing a lightweight read.
+    Returns True if connection is working.
     """
-    db = _get_db()
-    if db is None:
+    if not is_cloud_available():
         return False
 
-    # Quick connectivity check — try listing 1 document
     try:
-        next(iter(
-            db.collection(FIREBASE_PATIENTS_COLLECTION).limit(1).stream()
-        ), None)
+        coll = _get_collection()
+        # List collections is a lightweight operation
+        _db_client.collections()
         return True
     except Exception as exc:
-        logger.debug("Firebase connectivity check failed: %s", exc)
+        logger.error("Cloud connection verification failed: %s", exc)
         return False
 
 
-def get_firebase_status() -> Dict[str, Any]:
+def get_cloud_status() -> Dict[str, Any]:
     """
-    Return a detailed Firebase status dict for the system panel.
-
-    Returns
-    -------
-    dict:
-        available         : bool
-        sdk_installed     : bool
-        credentials_found : bool
-        project_id        : str
-        patients_collection   : str
-        assessments_collection: str
-        error             : str
+    Return detailed cloud database status for system status panel.
     """
-    sdk_ok  = FIREBASE_SDK_AVAILABLE
-    cred_ok = (
-        bool(os.getenv("FIREBASE_CREDENTIALS_JSON"))
-        or bool(os.getenv("FIREBASE_CREDENTIALS_PATH"))
-        or os.path.exists("data/firebase_credentials.json")
-    )
-    db      = _get_db()
-    avail   = db is not None
+    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    cred_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
 
-    error = ""
-    if not sdk_ok:
-        error = "firebase-admin not installed"
-    elif not cred_ok:
-        error = "No credentials found"
-    elif not avail:
-        error = "Firebase init failed"
+    has_creds = bool(cred_path or cred_json)
+    available = is_cloud_available()
+    connected = verify_connection() if available else False
 
     return {
-        "available":              avail,
-        "sdk_installed":          sdk_ok,
-        "credentials_found":      cred_ok,
-        "project_id":             os.getenv("FIREBASE_PROJECT_ID", FIREBASE_PROJECT_ID),
-        "patients_collection":    FIREBASE_PATIENTS_COLLECTION,
-        "assessments_collection": FIREBASE_ASSESSMENTS_COLLECTION,
-        "error":                  error,
+        "provider":       "Firebase Firestore",
+        "available":      available,
+        "connected":      connected,
+        "collection":     FIREBASE_COLLECTION,
+        "credentials_set": has_creds,
+        "init_error":     _init_error if not available else "",
+        "last_check":     now_str(),
     }
 
 
 # ─────────────────────────────────────────────
-# Sync result
+# Optional: Pull operations (for multi-device sync)
 # ─────────────────────────────────────────────
 
-@dataclass
-class SyncResult:
-    """Result of a batch sync operation."""
-    patients_pushed:    int = 0
-    assessments_pushed: int = 0
-    patients_failed:    int = 0
-    assessments_failed: int = 0
-    errors:             List[str] = field(default_factory=list)
-    duration_ms:        float = 0.0
-
-    @property
-    def total_pushed(self) -> int:
-        return self.patients_pushed + self.assessments_pushed
-
-    @property
-    def total_failed(self) -> int:
-        return self.patients_failed + self.assessments_failed
-
-    @property
-    def success(self) -> bool:
-        return self.total_failed == 0
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "patients_pushed":    self.patients_pushed,
-            "assessments_pushed": self.assessments_pushed,
-            "patients_failed":    self.patients_failed,
-            "assessments_failed": self.assessments_failed,
-            "total_pushed":       self.total_pushed,
-            "total_failed":       self.total_failed,
-            "success":            self.success,
-            "duration_ms":        round(self.duration_ms, 1),
-            "errors":             self.errors[:10],   # cap error list
-        }
-
-
-# ─────────────────────────────────────────────
-# Write operations
-# ─────────────────────────────────────────────
-
-def push_patient(patient: Dict[str, Any]) -> bool:
+def pull_patients(since: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Push a single patient record to Firestore.
-
-    Uses the patient_id as the Firestore document ID so that
-    re-pushing the same patient is idempotent (merge=True).
-
-    Parameters
-    ----------
-    patient : dict  — full patient record (from local_db or UI)
-
-    Returns
-    -------
-    True on success, False on failure.
+    Pull patient records from Firestore.
+    If 'since' is provided, only pull records synced after that timestamp.
     """
-    db = _get_db()
-    if db is None:
-        logger.warning("push_patient: Firebase not available")
-        return False
-
-    patient_id = patient.get("patient_id")
-    if not patient_id:
-        logger.error("push_patient: patient_id missing — cannot push")
-        return False
-
-    # Add cloud metadata
-    doc_data = dict(patient)
-    doc_data["cloud_updated_at"] = datetime.now(timezone.utc).isoformat()
-    doc_data["source"]           = "auraecho_plus"
-
-    # Remove non-serialisable items
-    doc_data.pop("_sa_instance_state", None)   # SQLAlchemy artifact if any
-
-    try:
-        db.collection(FIREBASE_PATIENTS_COLLECTION).document(patient_id).set(
-            doc_data, merge=True
-        )
-        logger.info("Patient pushed to Firebase: %s", patient_id)
-        return True
-    except Exception as exc:
-        logger.error("Failed to push patient %s: %s", patient_id, exc)
-        return False
-
-
-def push_assessment(assessment: Dict[str, Any]) -> bool:
-    """
-    Push a single assessment record to Firestore.
-
-    Parameters
-    ----------
-    assessment : dict  — assessment record (from local_db.get_assessments)
-
-    Returns
-    -------
-    True on success, False on failure.
-    """
-    db = _get_db()
-    if db is None:
-        return False
-
-    assessment_id = assessment.get("assessment_id")
-    if not assessment_id:
-        logger.error("push_assessment: assessment_id missing")
-        return False
-
-    doc_data = dict(assessment)
-    doc_data["cloud_updated_at"] = datetime.now(timezone.utc).isoformat()
-
-    # Serialise nested dicts/lists to JSON strings for Firestore
-    for field_name in ("ai_diagnosis", "similar_cases"):
-        val = doc_data.get(field_name)
-        if isinstance(val, (dict, list)):
-            doc_data[field_name] = json.dumps(val)
-
-    try:
-        db.collection(FIREBASE_ASSESSMENTS_COLLECTION).document(assessment_id).set(
-            doc_data, merge=True
-        )
-        logger.info("Assessment pushed to Firebase: %s", assessment_id)
-        return True
-    except Exception as exc:
-        logger.error("Failed to push assessment %s: %s", assessment_id, exc)
-        return False
-
-
-def batch_push(
-    patients:    List[Dict[str, Any]],
-    assessments: List[Dict[str, Any]],
-) -> SyncResult:
-    """
-    Push multiple patients and assessments in one call.
-
-    Uses Firestore batch writes (up to 500 documents per batch).
-
-    Parameters
-    ----------
-    patients    : list of patient dicts
-    assessments : list of assessment dicts
-
-    Returns
-    -------
-    SyncResult — detailed breakdown of what succeeded/failed
-    """
-    db = _get_db()
-    result = SyncResult()
-    t0 = time.monotonic()
-
-    if db is None:
-        result.patients_failed    = len(patients)
-        result.assessments_failed = len(assessments)
-        result.errors.append("Firebase not available")
-        result.duration_ms = (time.monotonic() - t0) * 1000
-        return result
-
-    # ── Push patients ───────────────────────────────────────────────
-    for p in patients:
-        success = push_patient(p)
-        if success:
-            result.patients_pushed += 1
-        else:
-            result.patients_failed += 1
-            result.errors.append(f"Patient {p.get('patient_id','?')} push failed")
-
-    # ── Push assessments ────────────────────────────────────────────
-    for a in assessments:
-        success = push_assessment(a)
-        if success:
-            result.assessments_pushed += 1
-        else:
-            result.assessments_failed += 1
-            result.errors.append(f"Assessment {a.get('assessment_id','?')} push failed")
-
-    result.duration_ms = (time.monotonic() - t0) * 1000
-
-    logger.info(
-        "Batch push complete: %d patients, %d assessments | %.0f ms | %d errors",
-        result.patients_pushed, result.assessments_pushed,
-        result.duration_ms, result.total_failed,
-    )
-    return result
-
-
-# ─────────────────────────────────────────────
-# Read operations
-# ─────────────────────────────────────────────
-
-def fetch_patient(patient_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch a single patient from Firestore by patient_id.
-
-    Returns
-    -------
-    Patient dict, or None if not found.
-    """
-    db = _get_db()
-    if db is None:
-        return None
-
-    try:
-        doc = db.collection(FIREBASE_PATIENTS_COLLECTION).document(patient_id).get()
-        if doc.exists:
-            data = doc.to_dict()
-            data["patient_id"] = patient_id
-            return data
-        return None
-    except Exception as exc:
-        logger.error("fetch_patient failed for %s: %s", patient_id, exc)
-        return None
-
-
-def fetch_all_patients(limit: int = 100) -> List[Dict[str, Any]]:
-    """
-    Fetch the most recent *limit* patients from Firestore.
-
-    Returns
-    -------
-    List of patient dicts, ordered by cloud_updated_at descending.
-    """
-    db = _get_db()
-    if db is None:
+    coll = _get_collection()
+    if coll is None:
         return []
 
     try:
-        docs = (
-            db.collection(FIREBASE_PATIENTS_COLLECTION)
-            .order_by("cloud_updated_at", direction="DESCENDING")
-            .limit(limit)
-            .stream()
-        )
+        query = coll.where("_meta.local_table", "==", DB_TABLE_PATIENTS)
+        if since:
+            query = query.where("_meta.synced_at", ">", since)
+
+        docs = query.stream()
         patients = []
         for doc in docs:
             data = doc.to_dict()
-            data["patient_id"] = doc.id
+            data["_doc_id"] = doc.id
             patients.append(data)
-        logger.info("Fetched %d patients from Firebase", len(patients))
+
+        logger.info("Pulled %d patients from cloud", len(patients))
         return patients
+
     except Exception as exc:
-        logger.error("fetch_all_patients failed: %s", exc)
+        logger.error("Failed to pull patients: %s", exc)
         return []
 
 
-def fetch_assessments(patient_id: str) -> List[Dict[str, Any]]:
+def pull_predictions(since: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Fetch all assessments for a patient from Firestore.
-
-    Returns
-    -------
-    List of assessment dicts, newest first.
+    Pull prediction records from Firestore.
     """
-    db = _get_db()
-    if db is None:
+    coll = _get_collection()
+    if coll is None:
         return []
 
     try:
-        docs = (
-            db.collection(FIREBASE_ASSESSMENTS_COLLECTION)
-            .where("patient_id", "==", patient_id)
-            .order_by("created_at", direction="DESCENDING")
-            .stream()
-        )
-        assessments = []
+        query = coll.where("_meta.local_table", "==", DB_TABLE_PREDICTIONS)
+        if since:
+            query = query.where("_meta.synced_at", ">", since)
+
+        docs = query.stream()
+        predictions = []
         for doc in docs:
             data = doc.to_dict()
-            data["assessment_id"] = doc.id
+            data["_doc_id"] = doc.id
+            predictions.append(data)
 
-            # Deserialise JSON strings
-            for json_field in ("ai_diagnosis", "similar_cases"):
-                val = data.get(json_field)
-                if isinstance(val, str):
-                    try:
-                        data[json_field] = json.loads(val)
-                    except json.JSONDecodeError:
-                        pass
+        logger.info("Pulled %d predictions from cloud", len(predictions))
+        return predictions
 
-            assessments.append(data)
-
-        return assessments
     except Exception as exc:
-        logger.error("fetch_assessments failed for %s: %s", patient_id, exc)
+        logger.error("Failed to pull predictions: %s", exc)
         return []
 
 
-def delete_patient_cloud(patient_id: str) -> bool:
-    """
-    Delete a patient and all their assessments from Firestore.
+# ─────────────────────────────────────────────
+# Module init
+# ─────────────────────────────────────────────
 
-    Returns
-    -------
-    True if the patient document was found and deleted.
-    """
-    db = _get_db()
-    if db is None:
-        return False
-
-    try:
-        # Delete patient document
-        db.collection(FIREBASE_PATIENTS_COLLECTION).document(patient_id).delete()
-
-        # Delete all linked assessments
-        assessment_docs = (
-            db.collection(FIREBASE_ASSESSMENTS_COLLECTION)
-            .where("patient_id", "==", patient_id)
-            .stream()
-        )
-        for doc in assessment_docs:
-            doc.reference.delete()
-
-        logger.info("Patient deleted from Firebase: %s", patient_id)
-        return True
-    except Exception as exc:
-        logger.error("Cloud delete failed for %s: %s", patient_id, exc)
-        return False
+try:
+    # Lazy init — don't fail app startup if cloud is not configured
+    pass
+except Exception as _exc:
+    logger.error("Cloud DB module error: %s", _exc)

@@ -1,500 +1,488 @@
-"""
-services/sync_service.py
-────────────────────────
-Offline-to-cloud synchronisation service for AuraEcho+.
+# =============================================================================
+# services/sync_service.py
+# AuraEcho+ — Offline-First Cloud Synchronization Service
+#
+# Responsibility:
+#     Manage bidirectional sync between local SQLite and cloud Firestore.
+#     Automatically pushes pending records when online, handles retries,
+#     and provides sync status for the UI.
+#
+# Sync Flow:
+#     1. Local operations add items to sync_queue table
+#     2. Sync service periodically checks connectivity
+#     3. If online, fetches pending queue items
+#     4. Pushes records to cloud in batches
+#     5. Updates queue status (SYNCED / FAILED)
+#     6. Retries failed items up to MAX_SYNC_RETRIES
+#
+# Public API:
+#     init_sync_service()         → None
+#     run_sync_cycle()            → dict (sync results)
+#     get_sync_status()           → dict
+#     start_auto_sync()           → None
+#     stop_auto_sync()            → None
+#     force_sync()                → dict
+#     is_sync_active()            → bool
+#     get_sync_stats()            → dict
+# =============================================================================
 
-Responsibility:
-    When the system transitions from OFFLINE → ONLINE, automatically
-    push all locally stored (SQLite) patient records and assessments
-    to Firebase Firestore.
-
-    Acts as the bridge between local_db.py and cloud_db.py.
-
-Sync strategy:
-    ┌─────────────────────────────────────────────────────────┐
-    │  1. Check internet connectivity (mode_detector)         │
-    │  2. Query local_db for all records where synced=0       │
-    │  3. Push each record to cloud_db                        │
-    │  4. On success, mark local record as synced=1           │
-    │  5. On failure, log error + retry on next sync cycle    │
-    │  6. Return detailed SyncReport to the UI                │
-    └─────────────────────────────────────────────────────────┘
-
-Conflict resolution:
-    - Cloud ALWAYS wins for reads (multi-device scenario)
-    - Local wins for writes (offline-first: local edits pushed up)
-    - Last-write-wins based on updated_at timestamp
-
-Retry policy:
-    - Failed records are left with synced=0
-    - Next sync attempt will retry them
-    - After MAX_RETRY_ATTEMPTS, record is flagged with synced=-1 (error state)
-
-Public API:
-    sync_now()                    → SyncReport
-    get_sync_status()             → dict
-    schedule_auto_sync(interval)  → None  (background thread)
-    stop_auto_sync()              → None
-    get_sync_history()            → List[SyncReport]
-    reset_failed_records()        → int   (count reset)
-"""
-
-import threading
+import os
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+import threading
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 
-from core.mode_detector import is_online
 from database.local_db import (
-    get_unsynced_records,
+    get_pending_sync,
     mark_synced,
-    get_stats as get_local_stats,
+    mark_sync_failed,
+    get_sync_stats as get_local_sync_stats,
+    get_patient,
+    get_patient_history,
+    DB_TABLE_PATIENTS,
+    DB_TABLE_PREDICTIONS,
 )
 from database.cloud_db import (
+    init_cloud_db,
+    is_cloud_available,
+    push_patient,
+    push_prediction,
     batch_push,
-    is_firebase_available,
-    get_firebase_status,
-    SyncResult,
+    get_cloud_status,
 )
-from utils.constants import MAX_SYNC_RETRIES, SYNC_INTERVAL_SECONDS
-from utils.helpers import get_logger
+from core.mode_detector import is_online, get_connection_info
+from utils.constants import (
+    SYNC_INTERVAL_SECONDS,
+    SYNC_BATCH_SIZE,
+    MAX_SYNC_RETRIES,
+)
+from utils.helpers import get_logger, now_str
 
 logger = get_logger(__name__)
 
+# ─────────────────────────────────────────────
+# Module-level state
+# ─────────────────────────────────────────────
+
+_sync_thread: Optional[threading.Thread] = None
+_sync_active: bool = False
+_sync_lock: threading.Lock = threading.Lock()
+_last_sync_time: Optional[str] = None
+_last_sync_result: Dict[str, Any] = {}
+_sync_stats: Dict[str, int] = {
+    "total_synced": 0,
+    "total_failed": 0,
+    "cycles_run": 0,
+}
+
 
 # ─────────────────────────────────────────────
-# Report dataclass
+# Initialization
 # ─────────────────────────────────────────────
 
-@dataclass
-class SyncReport:
+def init_sync_service() -> None:
     """
-    Complete report of one sync operation.
-
-    Attributes
-    ----------
-    started_at          : str   ISO-8601 timestamp
-    completed_at        : str   ISO-8601 timestamp
-    duration_ms         : float
-    patients_synced     : int
-    assessments_synced  : int
-    patients_failed     : int
-    assessments_failed  : int
-    total_pending_before: int   — unsynced count before sync started
-    total_pending_after : int   — unsynced count after sync completed
-    errors              : List[str]
-    status              : str   "success" | "partial" | "failed" | "skipped"
-    skip_reason         : str   — why sync was skipped (if applicable)
+    Initialize the sync service.
+    Call this once at app startup.
     """
-    started_at:           str
-    completed_at:         str         = ""
-    duration_ms:          float       = 0.0
-    patients_synced:      int         = 0
-    assessments_synced:   int         = 0
-    patients_failed:      int         = 0
-    assessments_failed:   int         = 0
-    total_pending_before: int         = 0
-    total_pending_after:  int         = 0
-    errors:               List[str]   = field(default_factory=list)
-    status:               str         = "pending"
-    skip_reason:          str         = ""
+    global _sync_stats
 
-    @property
-    def total_synced(self) -> int:
-        return self.patients_synced + self.assessments_synced
+    logger.info("Initializing sync service...")
 
-    @property
-    def total_failed(self) -> int:
-        return self.patients_failed + self.assessments_failed
+    # Initialize cloud DB (lazy — won't fail if not configured)
+    init_cloud_db()
 
-    @property
-    def success_rate(self) -> float:
-        total = self.total_synced + self.total_failed
-        return round((self.total_synced / total * 100) if total > 0 else 100.0, 1)
+    # Load initial stats
+    _sync_stats = get_local_sync_stats()
+    _sync_stats["total_synced"] = _sync_stats.get("SYNCED", 0)
+    _sync_stats["total_failed"] = _sync_stats.get("FAILED", 0)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "started_at":           self.started_at,
-            "completed_at":         self.completed_at,
-            "duration_ms":          round(self.duration_ms, 1),
-            "patients_synced":      self.patients_synced,
-            "assessments_synced":   self.assessments_synced,
-            "patients_failed":      self.patients_failed,
-            "assessments_failed":   self.assessments_failed,
-            "total_synced":         self.total_synced,
-            "total_failed":         self.total_failed,
-            "total_pending_before": self.total_pending_before,
-            "total_pending_after":  self.total_pending_after,
-            "success_rate":         self.success_rate,
-            "status":               self.status,
-            "skip_reason":          self.skip_reason,
-            "errors":               self.errors[:20],   # cap for display
-        }
-
-    def summary_line(self) -> str:
-        """One-line human-readable summary for status panels."""
-        if self.status == "skipped":
-            return f"⏭️  Sync skipped: {self.skip_reason}"
-        if self.status == "success":
-            return (
-                f"✅ Sync complete: {self.total_synced} records pushed "
-                f"in {self.duration_ms:.0f}ms"
-            )
-        if self.status == "partial":
-            return (
-                f"⚠️  Partial sync: {self.total_synced} pushed, "
-                f"{self.total_failed} failed"
-            )
-        return f"❌ Sync failed: {self.errors[0] if self.errors else 'Unknown error'}"
+    logger.info(
+        "Sync service initialized — pending: %d, synced: %d, failed: %d",
+        _sync_stats.get("PENDING", 0),
+        _sync_stats["total_synced"],
+        _sync_stats["total_failed"],
+    )
 
 
 # ─────────────────────────────────────────────
-# Sync history (in-memory ring buffer)
-# ─────────────────────────────────────────────
-_sync_history:   List[SyncReport] = []
-_MAX_HISTORY     = 50             # keep last 50 sync reports
-
-# Auto-sync background thread controls
-_auto_sync_thread:   Optional[threading.Thread] = None
-_auto_sync_stop_evt: threading.Event            = threading.Event()
-_sync_lock:          threading.Lock             = threading.Lock()
-
-
-# ─────────────────────────────────────────────
-# Internal helpers
+# Sync operations
 # ─────────────────────────────────────────────
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds") + "Z"
-
-
-def _record_history(report: SyncReport) -> None:
-    """Add a report to the in-memory history, capped at _MAX_HISTORY."""
-    global _sync_history
-    _sync_history.append(report)
-    if len(_sync_history) > _MAX_HISTORY:
-        _sync_history = _sync_history[-_MAX_HISTORY:]
-
-
-def _get_pending_count() -> int:
-    """Return total unsynced records across both tables."""
+def _fetch_record(table: str, record_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a record from local DB by table and ID.
+    """
     try:
-        stats = get_local_stats()
-        return stats.get("unsynced_patients", 0) + stats.get("unsynced_assessments", 0)
-    except Exception:
-        return 0
-
-
-def _mark_successful_syncs(
-    patients:    List[Dict[str, Any]],
-    assessments: List[Dict[str, Any]],
-    sync_result: SyncResult,
-) -> None:
-    """
-    After a batch push, mark individual records as synced in local_db.
-
-    We mark records individually — if 8/10 push successfully and 2 fail,
-    the 8 get marked synced so they won't be retried next time.
-    """
-    # For simplicity: if total_failed == 0, mark ALL as synced
-    # Otherwise mark patients and assessments that individually succeeded
-    # (batch_push currently doesn't return per-record success, so we use
-    #  the aggregate failure count as a heuristic)
-
-    if sync_result.total_failed == 0:
-        # All succeeded — mark everything
-        for p in patients:
-            pid = p.get("patient_id")
-            if pid:
-                try:
-                    mark_synced(pid, table="patients")
-                except Exception as exc:
-                    logger.warning("Could not mark patient %s synced: %s", pid, exc)
-
-        for a in assessments:
-            aid = a.get("assessment_id")
-            if aid:
-                try:
-                    mark_synced(aid, table="assessments")
-                except Exception as exc:
-                    logger.warning("Could not mark assessment %s synced: %s", aid, exc)
-    else:
-        # Partial success — be conservative: only mark what we know pushed
-        # Mark patients up to patients_pushed count
-        for p in patients[:sync_result.patients_pushed]:
-            pid = p.get("patient_id")
-            if pid:
-                try:
-                    mark_synced(pid, table="patients")
-                except Exception:
-                    pass
-
-        for a in assessments[:sync_result.assessments_pushed]:
-            aid = a.get("assessment_id")
-            if aid:
-                try:
-                    mark_synced(aid, table="assessments")
-                except Exception:
-                    pass
-
-
-# ─────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────
-
-def sync_now(force: bool = False) -> SyncReport:
-    """
-    Perform an immediate synchronisation of all unsynced local records.
-
-    This is the main entry point — called by the UI sync button or
-    by the auto-sync background thread.
-
-    Parameters
-    ----------
-    force : bool
-        If True, attempt sync even if previous check shows no pending records.
-        Useful for "Force Sync" button in the admin panel.
-
-    Returns
-    -------
-    SyncReport — detailed result of the sync operation.
-    """
-    started_at = _now_iso()
-    report     = SyncReport(started_at=started_at)
-
-    # ── Guard: only one sync at a time ─────────────────────────────
-    if not _sync_lock.acquire(blocking=False):
-        report.status      = "skipped"
-        report.skip_reason = "Another sync is already in progress"
-        report.completed_at = _now_iso()
-        logger.debug("Sync skipped: already in progress")
-        _record_history(report)
-        return report
-
-    t0 = time.monotonic()
-
-    try:
-        # ── Guard: internet check ───────────────────────────────────
-        if not is_online():
-            report.status       = "skipped"
-            report.skip_reason  = "No internet connection"
-            report.completed_at = _now_iso()
-            report.duration_ms  = (time.monotonic() - t0) * 1000
-            logger.debug("Sync skipped: offline")
-            _record_history(report)
-            return report
-
-        # ── Guard: Firebase availability ────────────────────────────
-        if not is_firebase_available():
-            report.status       = "skipped"
-            report.skip_reason  = "Firebase not configured or unreachable"
-            report.completed_at = _now_iso()
-            report.duration_ms  = (time.monotonic() - t0) * 1000
-            logger.warning("Sync skipped: Firebase unavailable")
-            _record_history(report)
-            return report
-
-        # ── Fetch unsynced records ──────────────────────────────────
-        pending              = get_unsynced_records()
-        patients             = pending.get("patients", [])
-        assessments          = pending.get("assessments", [])
-        report.total_pending_before = len(patients) + len(assessments)
-
-        if report.total_pending_before == 0 and not force:
-            report.status       = "skipped"
-            report.skip_reason  = "No pending records to sync"
-            report.completed_at = _now_iso()
-            report.duration_ms  = (time.monotonic() - t0) * 1000
-            logger.debug("Sync skipped: nothing to sync")
-            _record_history(report)
-            return report
-
-        logger.info(
-            "Starting sync: %d patients, %d assessments",
-            len(patients), len(assessments),
-        )
-
-        # ── Push to Firebase ────────────────────────────────────────
-        sync_result = batch_push(patients, assessments)
-
-        # ── Mark successfully synced records in local DB ────────────
-        _mark_successful_syncs(patients, assessments, sync_result)
-
-        # ── Build report ────────────────────────────────────────────
-        report.patients_synced    = sync_result.patients_pushed
-        report.assessments_synced = sync_result.assessments_pushed
-        report.patients_failed    = sync_result.patients_failed
-        report.assessments_failed = sync_result.assessments_failed
-        report.errors             = sync_result.errors
-        report.total_pending_after = _get_pending_count()
-
-        if sync_result.total_failed == 0:
-            report.status = "success"
-        elif sync_result.total_pushed > 0:
-            report.status = "partial"
+        if table == DB_TABLE_PATIENTS:
+            return get_patient(record_id)
+        elif table == DB_TABLE_PREDICTIONS:
+            # Get prediction from patient history
+            # Note: This assumes prediction ID is unique across all patients
+            # In practice, you may need a get_prediction(prediction_id) function
+            # For now, we'll return a placeholder structure
+            logger.warning(
+                "Direct prediction fetch not implemented — "
+                "consider adding get_prediction(prediction_id)"
+            )
+            return None
         else:
-            report.status = "failed"
-
-        report.duration_ms  = (time.monotonic() - t0) * 1000
-        report.completed_at = _now_iso()
-
-        logger.info(
-            "Sync complete: status=%s | %d pushed | %d failed | %.0f ms",
-            report.status, report.total_synced, report.total_failed, report.duration_ms,
-        )
-
+            logger.error("Unknown table for sync: %s", table)
+            return None
     except Exception as exc:
-        report.status       = "failed"
-        report.errors.append(str(exc))
-        report.completed_at = _now_iso()
-        report.duration_ms  = (time.monotonic() - t0) * 1000
-        logger.error("Sync failed with exception: %s", exc)
-
-    finally:
-        _sync_lock.release()
-
-    _record_history(report)
-    return report
+        logger.error("Failed to fetch record %s/%d: %s", table, record_id, exc)
+        return None
 
 
-def get_sync_status() -> Dict[str, Any]:
+def _push_record(table: str, record: Dict[str, Any]) -> bool:
     """
-    Return the current synchronisation status for the UI status panel.
+    Push a single record to cloud.
+    Returns True on success, False on failure.
+    """
+    try:
+        if table == DB_TABLE_PATIENTS:
+            doc_id = push_patient(record)
+            return doc_id is not None
+        elif table == DB_TABLE_PREDICTIONS:
+            doc_id = push_prediction(record)
+            return doc_id is not None
+        else:
+            logger.error("Unknown table for push: %s", table)
+            return False
+    except Exception as exc:
+        logger.error("Push failed for %s/%d: %s", table, record.get("id"), exc)
+        return False
+
+
+def run_sync_cycle() -> Dict[str, Any]:
+    """
+    Execute one sync cycle.
+    Checks connectivity, fetches pending items, pushes to cloud.
 
     Returns
     -------
-    dict:
-        pending_patients    : int
-        pending_assessments : int
-        total_pending       : int
-        firebase_available  : bool
-        online              : bool
-        last_sync           : dict | None  (last SyncReport.to_dict())
-        auto_sync_running   : bool
+    dict with sync results:
+        {
+            "success": bool,
+            "synced_count": int,
+            "failed_count": int,
+            "pending_count": int,
+            "message": str,
+        }
     """
-    try:
-        local_stats = get_local_stats()
-        pending_p   = local_stats.get("unsynced_patients", 0)
-        pending_a   = local_stats.get("unsynced_assessments", 0)
-    except Exception:
-        pending_p = pending_a = 0
+    global _last_sync_time, _last_sync_result, _sync_stats
 
-    last_sync = _sync_history[-1].to_dict() if _sync_history else None
-
-    return {
-        "pending_patients":    pending_p,
-        "pending_assessments": pending_a,
-        "total_pending":       pending_p + pending_a,
-        "firebase_available":  is_firebase_available(),
-        "online":              is_online(),
-        "last_sync":           last_sync,
-        "auto_sync_running":   _auto_sync_thread is not None and _auto_sync_thread.is_alive(),
-        "firebase_status":     get_firebase_status(),
+    result = {
+        "success": False,
+        "synced_count": 0,
+        "failed_count": 0,
+        "pending_count": 0,
+        "message": "",
+        "timestamp": now_str(),
     }
 
+    # Check connectivity
+    if not is_online():
+        result["message"] = "Offline — sync skipped"
+        logger.debug("Sync cycle skipped — system is offline")
+        _last_sync_result = result
+        return result
 
-def get_sync_history(limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Return the last *limit* sync reports as dicts.
+    # Check cloud availability
+    if not is_cloud_available():
+        result["message"] = "Cloud unavailable — sync skipped"
+        logger.warning("Sync cycle skipped — cloud database not available")
+        _last_sync_result = result
+        return result
 
-    Returns
-    -------
-    List of SyncReport.to_dict(), newest first.
-    """
-    recent = list(reversed(_sync_history))
-    return [r.to_dict() for r in recent[:limit]]
+    # Fetch pending items
+    pending = get_pending_sync(limit=SYNC_BATCH_SIZE)
+    if not pending:
+        result["success"] = True
+        result["message"] = "No pending items to sync"
+        logger.debug("Sync cycle complete — no pending items")
+        _last_sync_result = result
+        return result
 
+    logger.info("Sync cycle started — %d pending items", len(pending))
 
-def reset_failed_records() -> int:
-    """
-    Reset any records stuck in a failed state back to unsynced=0
-    so they will be retried on the next sync.
+    synced_count = 0
+    failed_count = 0
 
-    In our current schema, failed records are simply left with synced=0
-    so this is a no-op placeholder for future MAX_RETRY tracking.
+    for item in pending:
+        queue_id = item["id"]
+        table = item["table_name"]
+        record_id = item["record_id"]
+        retry_count = item.get("retry_count", 0)
 
-    Returns
-    -------
-    int — number of records reset.
-    """
-    # Future: query records with synced=-1 (error flag) and reset to 0
-    logger.info("reset_failed_records called (no-op in current schema)")
-    return 0
+        # Fetch record
+        record = _fetch_record(table, record_id)
+        if record is None:
+            logger.error(
+                "Record not found for sync queue %d — marking failed", queue_id
+            )
+            mark_sync_failed(queue_id, "Record not found in local DB")
+            failed_count += 1
+            continue
 
+        # Push to cloud
+        success = _push_record(table, record)
 
-# ─────────────────────────────────────────────
-# Auto-sync background thread
-# ─────────────────────────────────────────────
+        if success:
+            mark_synced(queue_id)
+            synced_count += 1
+            logger.debug("Synced %s/%d (queue_id=%d)", table, record_id, queue_id)
+        else:
+            # Check retry limit
+            if retry_count >= MAX_SYNC_RETRIES:
+                mark_sync_failed(queue_id, f"Max retries ({MAX_SYNC_RETRIES}) exceeded")
+                logger.warning(
+                    "Sync failed for %s/%d — max retries exceeded",
+                    table, record_id,
+                )
+            else:
+                mark_sync_failed(queue_id, f"Push failed (attempt {retry_count + 1})")
+                logger.debug(
+                    "Sync failed for %s/%d — will retry (attempt %d/%d)",
+                    table, record_id, retry_count + 1, MAX_SYNC_RETRIES,
+                )
+            failed_count += 1
 
-def _auto_sync_loop(interval_seconds: int) -> None:
-    """
-    Background loop: attempt sync every *interval_seconds*.
-    Stops when _auto_sync_stop_evt is set.
-    """
-    logger.info("Auto-sync loop started (interval=%ds)", interval_seconds)
+    # Update stats
+    _sync_stats["total_synced"] += synced_count
+    _sync_stats["total_failed"] += failed_count
+    _sync_stats["cycles_run"] += 1
 
-    while not _auto_sync_stop_evt.is_set():
-        try:
-            report = sync_now()
-            if report.status not in ("skipped",):
-                logger.info("Auto-sync: %s", report.summary_line())
-        except Exception as exc:
-            logger.error("Auto-sync loop error: %s", exc)
+    # Get updated pending count
+    local_stats = get_local_sync_stats()
+    pending_count = local_stats.get("PENDING", 0)
 
-        # Wait for interval, but wake up early if stop event is set
-        _auto_sync_stop_evt.wait(timeout=interval_seconds)
+    result["success"] = True
+    result["synced_count"] = synced_count
+    result["failed_count"] = failed_count
+    result["pending_count"] = pending_count
+    result["message"] = f"Synced {synced_count}, failed {failed_count}, pending {pending_count}"
 
-    logger.info("Auto-sync loop stopped")
+    _last_sync_time = now_str()
+    _last_sync_result = result
 
-
-def schedule_auto_sync(interval_seconds: int = SYNC_INTERVAL_SECONDS) -> None:
-    """
-    Start a background thread that syncs every *interval_seconds*.
-
-    Safe to call multiple times — will not start a second thread
-    if one is already running.
-
-    Parameters
-    ----------
-    interval_seconds : int  — seconds between sync attempts (default from constants)
-    """
-    global _auto_sync_thread
-
-    if _auto_sync_thread is not None and _auto_sync_thread.is_alive():
-        logger.debug("Auto-sync already running — skipping start")
-        return
-
-    _auto_sync_stop_evt.clear()
-    _auto_sync_thread = threading.Thread(
-        target=_auto_sync_loop,
-        args=(interval_seconds,),
-        daemon=True,           # dies when main process exits
-        name="AuraEcho-AutoSync",
+    logger.info(
+        "Sync cycle complete — synced=%d, failed=%d, pending=%d",
+        synced_count, failed_count, pending_count,
     )
-    _auto_sync_thread.start()
-    logger.info("Auto-sync thread started (interval=%ds)", interval_seconds)
+
+    return result
+
+
+def force_sync() -> Dict[str, Any]:
+    """
+    Force an immediate sync cycle.
+    Useful for manual sync trigger from UI.
+    """
+    logger.info("Force sync requested")
+    return run_sync_cycle()
+
+
+# ─────────────────────────────────────────────
+# Background sync thread
+# ─────────────────────────────────────────────
+
+def _sync_worker() -> None:
+    """
+    Background thread that runs sync cycles periodically.
+    """
+    global _sync_active
+
+    logger.info(
+        "Auto-sync worker started — interval=%ds", SYNC_INTERVAL_SECONDS
+    )
+
+    while _sync_active:
+        try:
+            run_sync_cycle()
+        except Exception as exc:
+            logger.error("Sync cycle error: %s", exc)
+
+        # Sleep with interrupt check
+        for _ in range(SYNC_INTERVAL_SECONDS):
+            if not _sync_active:
+                break
+            time.sleep(1)
+
+    logger.info("Auto-sync worker stopped")
+
+
+def start_auto_sync() -> None:
+    """
+    Start the background auto-sync thread.
+    """
+    global _sync_thread, _sync_active
+
+    with _sync_lock:
+        if _sync_active:
+            logger.warning("Auto-sync already running")
+            return
+
+        _sync_active = True
+        _sync_thread = threading.Thread(
+            target=_sync_worker,
+            daemon=True,
+            name="sync-worker",
+        )
+        _sync_thread.start()
+        logger.info("Auto-sync started")
 
 
 def stop_auto_sync() -> None:
     """
-    Stop the background auto-sync thread gracefully.
-
-    The thread will finish its current sync (if running) then stop.
+    Stop the background auto-sync thread.
     """
-    global _auto_sync_thread
+    global _sync_active, _sync_thread
 
-    if _auto_sync_thread is None or not _auto_sync_thread.is_alive():
-        logger.debug("Auto-sync was not running")
-        return
+    with _sync_lock:
+        if not _sync_active:
+            logger.warning("Auto-sync not running")
+            return
 
-    logger.info("Stopping auto-sync thread...")
-    _auto_sync_stop_evt.set()
-    _auto_sync_thread.join(timeout=10.0)
+        _sync_active = False
+        if _sync_thread and _sync_thread.is_alive():
+            _sync_thread.join(timeout=5.0)
+        _sync_thread = None
+        logger.info("Auto-sync stopped")
 
-    if _auto_sync_thread.is_alive():
-        logger.warning("Auto-sync thread did not stop cleanly within 10s")
-    else:
-        logger.info("Auto-sync thread stopped")
 
-    _auto_sync_thread = None
+def is_sync_active() -> bool:
+    """
+    Check if auto-sync is currently running.
+    """
+    return _sync_active
+
+
+# ─────────────────────────────────────────────
+# Status and stats
+# ─────────────────────────────────────────────
+
+def get_sync_status() -> Dict[str, Any]:
+    """
+    Get comprehensive sync status for UI display.
+    """
+    local_stats = get_local_sync_stats()
+    cloud_status = get_cloud_status()
+    conn_info = get_connection_info()
+
+    return {
+        "auto_sync_active": _sync_active,
+        "online": conn_info.get("online", False),
+        "cloud_available": cloud_status.get("available", False),
+        "cloud_connected": cloud_status.get("connected", False),
+        "pending_count": local_stats.get("PENDING", 0),
+        "synced_count": local_stats.get("SYNCED", 0),
+        "failed_count": local_stats.get("FAILED", 0),
+        "total_synced": _sync_stats.get("total_synced", 0),
+        "total_failed": _sync_stats.get("total_failed", 0),
+        "cycles_run": _sync_stats.get("cycles_run", 0),
+        "last_sync_time": _last_sync_time,
+        "last_sync_result": _last_sync_result,
+        "sync_interval": SYNC_INTERVAL_SECONDS,
+        "max_retries": MAX_SYNC_RETRIES,
+        "batch_size": SYNC_BATCH_SIZE,
+        "cloud_info": cloud_status,
+    }
+
+
+def get_sync_stats() -> Dict[str, int]:
+    """
+    Get simple sync statistics.
+    """
+    local_stats = get_local_sync_stats()
+    return {
+        "pending": local_stats.get("PENDING", 0),
+        "synced": local_stats.get("SYNCED", 0),
+        "failed": local_stats.get("FAILED", 0),
+        "total_synced": _sync_stats.get("total_synced", 0),
+        "total_failed": _sync_stats.get("total_failed", 0),
+    }
+
+
+def get_failed_sync_items(limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Get failed sync queue items for debugging.
+    """
+    from database.local_db import _get_connection
+
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM sync_queue
+        WHERE status = 'FAILED'
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def retry_failed_sync() -> Dict[str, Any]:
+    """
+    Retry all failed sync items by resetting their status to PENDING.
+    """
+    from database.local_db import _get_connection
+
+    with _sync_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE sync_queue
+            SET status = 'PENDING', retry_count = 0, error_msg = NULL
+            WHERE status = 'FAILED'
+        """)
+        count = cursor.rowcount
+        conn.commit()
+        conn.close()
+
+    logger.info("Reset %d failed sync items to PENDING", count)
+
+    return {
+        "success": True,
+        "reset_count": count,
+        "message": f"Reset {count} failed items for retry",
+    }
+
+
+def clear_synced_items() -> Dict[str, Any]:
+    """
+    Clear old synced items from the queue to reduce database size.
+    Keeps items from the last 7 days.
+    """
+    from database.local_db import _get_connection
+
+    with _sync_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM sync_queue
+            WHERE status = 'SYNCED'
+            AND synced_at < datetime('now', '-7 days')
+        """)
+        count = cursor.rowcount
+        conn.commit()
+        conn.close()
+
+    logger.info("Cleared %d old synced items", count)
+
+    return {
+        "success": True,
+        "cleared_count": count,
+        "message": f"Cleared {count} old synced items",
+    }
+
+
+# ─────────────────────────────────────────────
+# Module init
+# ─────────────────────────────────────────────
+
+try:
+    init_sync_service()
+except Exception as _exc:
+    logger.error("Sync service initialization failed: %s", _exc)

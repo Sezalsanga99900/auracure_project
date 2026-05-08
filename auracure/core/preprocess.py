@@ -11,17 +11,18 @@ Responsibility:
 Pipeline stages:
     1. Type coercion   — cast strings → int/float
     2. Missing-value   — fill with column medians / mode
-    3. Encoding        — map categorical labels → integers
-    4. Range clamping  — clip values to clinically valid bounds
-    5. Scaling         — MinMax scale to [0, 1] per feature
-    6. Column ordering — guarantee consistent feature vector order
+    3. Range clamping  — clip values to clinically valid bounds
+    4. Scaling         — MinMax scale to [0, 1] per feature
+    5. Column ordering — guarantee consistent feature vector order
 
 Public API:
-    preprocess_patient(patient_dict)  → np.ndarray  shape (1, 13)
-    preprocess_dataframe(df)          → np.ndarray  shape (N, 13)
-    get_feature_names()               → List[str]
-    inverse_transform(array)          → np.ndarray  (unscale)
-    fit_scaler(df)                    → fitted scaler  (call once at startup)
+    preprocess_patient(patient_dict, validate)  → np.ndarray  shape (1, 13)
+    preprocess_dataframe(df)                    → np.ndarray  shape (N, 13)
+    get_feature_names()                         → List[str]
+    inverse_transform(array)                    → np.ndarray
+    fit_scaler(df)                              → fitted scaler
+    get_preprocessing_summary(patient)          → Dict
+    validate_before_preprocess(patient)         → Tuple[bool, List[str]]
 """
 
 import os
@@ -38,8 +39,9 @@ from utils.constants import (
     FEATURE_COLUMNS,
     FEATURE_RANGES,
     CATEGORICAL_ENCODINGS,
-    DATA_PATH,
-    SCALER_PATH,
+    CATEGORICAL_FEATURES,
+    HEART_DATA_PATH,
+    SCALER_SAVE_PATH,
     TARGET_COLUMN,
 )
 from utils.helpers import get_logger
@@ -48,20 +50,10 @@ warnings.filterwarnings("ignore", category=UserWarning)
 logger = get_logger(__name__)
 
 # ─────────────────────────────────────────────
-# Column medians / modes used for imputation
-# (populated when fit_scaler() or _load_scaler() runs)
+# Module-level state
 # ─────────────────────────────────────────────
 _FILL_VALUES: Dict[str, Any] = {}
 _scaler: Optional[MinMaxScaler] = None
-
-
-# ─────────────────────────────────────────────
-# Encoding maps  (centralised in constants but
-# mirrored here for fast lookup)
-# ─────────────────────────────────────────────
-
-# Maps human-readable UI strings → integer codes
-_ENCODE: Dict[str, Dict[str, int]] = CATEGORICAL_ENCODINGS
 
 
 # ─────────────────────────────────────────────
@@ -72,28 +64,27 @@ def _coerce_types(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     Stage 1 — Type coercion.
 
-    Convert every field to its expected Python numeric type.
-    Non-numeric strings that survive the encoding step are set to NaN
-    so the imputer can handle them in stage 2.
+    FIXED: Encoding lookup no longer uses falsy-zero bug.
+           mapping.get(raw_val) or mapping.get(raw_val.lower())
+           → explicit None check so code=0 is not skipped.
     """
     coerced: Dict[str, Any] = {}
 
     for col in FEATURE_COLUMNS:
         raw_val = raw.get(col)
 
-        # ── Categorical fields: map label → int ──────────────────────
-        if col in _ENCODE:
-            mapping = _ENCODE[col]
+        if col in CATEGORICAL_ENCODINGS:
+            mapping = CATEGORICAL_ENCODINGS[col]
             if isinstance(raw_val, str):
-                # Try exact match, then case-insensitive
-                encoded = mapping.get(raw_val) or mapping.get(raw_val.lower())
+                # FIXED: explicit None check (avoids falsy 0 bug)
+                encoded = mapping.get(raw_val)
+                if encoded is None:
+                    encoded = mapping.get(raw_val.lower())
                 coerced[col] = float(encoded) if encoded is not None else np.nan
             elif raw_val is None:
                 coerced[col] = np.nan
             else:
-                coerced[col] = float(raw_val)   # already numeric
-
-        # ── Continuous / ordinal fields ──────────────────────────────
+                coerced[col] = float(raw_val)
         else:
             try:
                 coerced[col] = float(raw_val) if raw_val is not None else np.nan
@@ -108,8 +99,8 @@ def _impute_missing(coerced: Dict[str, Any]) -> Dict[str, Any]:
     Stage 2 — Missing value imputation.
 
     Uses pre-computed _FILL_VALUES (medians for continuous,
-    mode for categorical).  Falls back to the feature midpoint
-    if _FILL_VALUES hasn't been populated yet.
+    mode for categorical). Falls back to the feature midpoint
+    if _FILL_VALUES has not been populated yet.
     """
     imputed = dict(coerced)
 
@@ -118,10 +109,11 @@ def _impute_missing(coerced: Dict[str, Any]) -> Dict[str, Any]:
         if val is None or (isinstance(val, float) and np.isnan(val)):
             fill = _FILL_VALUES.get(col)
             if fill is None:
-                # Fallback: midpoint of valid range
                 lo, hi = FEATURE_RANGES.get(col, (0, 1))
                 fill = (lo + hi) / 2.0
-                logger.debug("No fill value for %s; using midpoint %.2f", col, fill)
+                logger.debug(
+                    "No fill value for '%s'; using midpoint %.2f", col, fill
+                )
             imputed[col] = fill
             logger.debug("Imputed missing field '%s' with %.4f", col, fill)
 
@@ -132,16 +124,16 @@ def _clamp_ranges(imputed: Dict[str, Any]) -> Dict[str, Any]:
     """
     Stage 3 — Range clamping.
 
-    Clip each feature to its clinically valid [min, max] so that
-    extreme outliers don't distort the scaler.
+    FIXED: Only applies to NUMERICAL features that appear in FEATURE_RANGES.
+           Categorical features are skipped (already encoded to valid ints).
     """
     clamped = dict(imputed)
 
     for col in FEATURE_COLUMNS:
+        # Numerical only — categorical already encoded to valid int
         if col in FEATURE_RANGES:
             lo, hi = FEATURE_RANGES[col]
-            val = clamped[col]
-            clamped[col] = float(np.clip(val, lo, hi))
+            clamped[col] = float(np.clip(clamped[col], lo, hi))
 
     return clamped
 
@@ -149,11 +141,12 @@ def _clamp_ranges(imputed: Dict[str, Any]) -> Dict[str, Any]:
 def _to_feature_array(patient_dict: Dict[str, Any]) -> np.ndarray:
     """
     Convert a fully processed dict → ordered 1-D NumPy array.
-
-    Column order is determined by FEATURE_COLUMNS so the scaler
-    and the model always see features in the same position.
+    Column order is determined by FEATURE_COLUMNS.
     """
-    return np.array([patient_dict[col] for col in FEATURE_COLUMNS], dtype=np.float64)
+    return np.array(
+        [patient_dict[col] for col in FEATURE_COLUMNS],
+        dtype=np.float64,
+    )
 
 
 # ─────────────────────────────────────────────
@@ -163,14 +156,13 @@ def _to_feature_array(patient_dict: Dict[str, Any]) -> np.ndarray:
 def _compute_fill_values(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Compute per-column imputation values from a reference DataFrame.
-
     Categorical → mode  |  Continuous → median
     """
     fills: Dict[str, Any] = {}
     for col in FEATURE_COLUMNS:
         if col not in df.columns:
             continue
-        if col in _ENCODE:
+        if col in CATEGORICAL_ENCODINGS:
             mode_vals = df[col].mode()
             fills[col] = float(mode_vals.iloc[0]) if len(mode_vals) else 0.0
         else:
@@ -182,12 +174,15 @@ def fit_scaler(df: Optional[pd.DataFrame] = None) -> MinMaxScaler:
     """
     Fit (or re-fit) the MinMaxScaler on *df*.
 
-    If *df* is None, loads DATA_PATH automatically.
+    FIXED: Runs the full encoding pipeline on all rows before fitting
+           the scaler — previously fitted on raw (possibly string) data.
+
+    If *df* is None, loads HEART_DATA_PATH automatically.
 
     Side effects
     ------------
-    - Populates the module-level _scaler and _FILL_VALUES.
-    - Persists the scaler to SCALER_PATH (pickle) for future runs.
+    - Populates module-level _scaler and _FILL_VALUES.
+    - Persists scaler + fill values to SCALER_SAVE_PATH (pickle).
 
     Returns
     -------
@@ -196,51 +191,75 @@ def fit_scaler(df: Optional[pd.DataFrame] = None) -> MinMaxScaler:
     global _scaler, _FILL_VALUES
 
     if df is None:
-        if not os.path.exists(DATA_PATH):
-            raise FileNotFoundError(f"Training data not found at {DATA_PATH}")
-        df = pd.read_csv(DATA_PATH)
-        logger.info("Loaded training data from %s (%d rows)", DATA_PATH, len(df))
+        if not os.path.exists(HEART_DATA_PATH):
+            raise FileNotFoundError(
+                f"Training data not found at {HEART_DATA_PATH}"
+            )
+        df = pd.read_csv(HEART_DATA_PATH)
+        logger.info(
+            "Loaded training data from %s (%d rows)",
+            HEART_DATA_PATH, len(df),
+        )
 
-    # Keep only feature columns (drop target if present)
-    feature_df = df[[c for c in FEATURE_COLUMNS if c in df.columns]].copy()
+    feature_df = df[
+        [c for c in FEATURE_COLUMNS if c in df.columns]
+    ].copy()
 
-    # Compute fill values BEFORE fitting the scaler
+    # Compute fill values from RAW df (before encoding)
     _FILL_VALUES = _compute_fill_values(feature_df)
     logger.debug("Fill values computed: %s", _FILL_VALUES)
 
-    # Fit scaler
+    # FIXED: Run full pipeline on every row before fitting scaler
+    records = feature_df.to_dict(orient="records")
+    processed = []
+    for rec in records:
+        coerced = _coerce_types(rec)
+        imputed  = _impute_missing(coerced)
+        clamped  = _clamp_ranges(imputed)
+        processed.append(_to_feature_array(clamped))
+
+    clean_X = np.vstack(processed)   # shape (N, 13) — fully numeric
+
+    # Fit scaler on clean processed array
     _scaler = MinMaxScaler(feature_range=(0, 1))
-    _scaler.fit(feature_df[FEATURE_COLUMNS])
-    logger.info("MinMaxScaler fitted on %d samples, %d features", len(feature_df), len(FEATURE_COLUMNS))
+    _scaler.fit(clean_X)
+    logger.info(
+        "MinMaxScaler fitted on %d samples, %d features",
+        len(clean_X), len(FEATURE_COLUMNS),
+    )
 
     # Persist to disk
-    scaler_dir = Path(SCALER_PATH).parent
+    scaler_dir = Path(SCALER_SAVE_PATH).parent
     scaler_dir.mkdir(parents=True, exist_ok=True)
-    with open(SCALER_PATH, "wb") as fh:
+    with open(SCALER_SAVE_PATH, "wb") as fh:
+        # NOTE: Only load pickle files from trusted sources.
         pickle.dump({"scaler": _scaler, "fill_values": _FILL_VALUES}, fh)
-    logger.info("Scaler persisted to %s", SCALER_PATH)
+    logger.info("Scaler persisted to %s", SCALER_SAVE_PATH)
 
     return _scaler
 
 
 def _load_scaler() -> MinMaxScaler:
     """
-    Load a previously fitted scaler from SCALER_PATH.
-    If the file doesn't exist, call fit_scaler() to create one.
+    Load a previously fitted scaler from SCALER_SAVE_PATH.
+    If the file does not exist, call fit_scaler() to create one.
     """
     global _scaler, _FILL_VALUES
 
     if _scaler is not None:
-        return _scaler                          # already loaded in memory
+        return _scaler
 
-    if os.path.exists(SCALER_PATH):
-        with open(SCALER_PATH, "rb") as fh:
+    if os.path.exists(SCALER_SAVE_PATH):
+        with open(SCALER_SAVE_PATH, "rb") as fh:
+            # NOTE: Only load from trusted sources.
             payload = pickle.load(fh)
-        _scaler = payload["scaler"]
+        _scaler      = payload["scaler"]
         _FILL_VALUES = payload.get("fill_values", {})
-        logger.info("Scaler loaded from %s", SCALER_PATH)
+        logger.info("Scaler loaded from %s", SCALER_SAVE_PATH)
     else:
-        logger.warning("Scaler not found at %s — fitting from scratch", SCALER_PATH)
+        logger.warning(
+            "Scaler not found at %s — fitting from scratch", SCALER_SAVE_PATH
+        )
         fit_scaler()
 
     return _scaler
@@ -261,52 +280,85 @@ def get_feature_names() -> List[str]:
     return list(FEATURE_COLUMNS)
 
 
-def preprocess_patient(patient: Dict[str, Any]) -> np.ndarray:
+def validate_before_preprocess(
+    patient: Dict[str, Any],
+) -> Tuple[bool, List[str]]:
+    """
+    ADDED: Quick sanity check before running the pipeline.
+
+    Returns (ok, list_of_warnings).
+    Warnings do not block processing — pipeline handles missing values.
+    """
+    warnings_list: List[str] = []
+
+    for col in FEATURE_COLUMNS:
+        if col not in patient:
+            warnings_list.append(f"Missing field: '{col}'")
+        elif patient[col] is None:
+            warnings_list.append(f"Null value for: '{col}'")
+
+    return len(warnings_list) == 0, warnings_list
+
+
+def preprocess_patient(
+    patient: Dict[str, Any],
+    validate: bool = True,           # ADDED: optional pre-validation
+) -> np.ndarray:
     """
     Full preprocessing pipeline for a single patient dict.
 
+    ADDED: validate parameter — if True, runs validate_before_preprocess()
+           and logs warnings before processing.
+
     Steps
     -----
-    1. Type coercion (strings → numbers, labels → codes)
-    2. Missing-value imputation  
+    1. Type coercion
+    2. Missing-value imputation
     3. Range clamping
     4. MinMax scaling to [0, 1]
 
     Parameters
     ----------
-    patient : dict
-        Raw patient record from the UI form or sample_input.json.
-        Keys must include all FEATURE_COLUMNS (extras are ignored).
+    patient  : dict — raw patient record from UI form or sample_input.json
+    validate : bool — whether to run pre-validation (default True)
 
     Returns
     -------
-    np.ndarray  shape (1, 13)  — ready for model.predict() / KNN
+    np.ndarray  shape (1, 13)
     """
-    logger.debug("Preprocessing patient: %s", {k: v for k, v in patient.items() if k in FEATURE_COLUMNS})
+    if validate:
+        ok, warnings_list = validate_before_preprocess(patient)
+        if not ok:
+            logger.warning(
+                "preprocess_patient: %d field warning(s): %s",
+                len(warnings_list), warnings_list,
+            )
 
-    # Pipeline stages
+    logger.debug(
+        "Preprocessing patient: %s",
+        {k: v for k, v in patient.items() if k in FEATURE_COLUMNS},
+    )
+
     coerced  = _coerce_types(patient)
     imputed  = _impute_missing(coerced)
     clamped  = _clamp_ranges(imputed)
+    raw_arr  = _to_feature_array(clamped).reshape(1, -1)   # shape (1, 13)
+    scaled   = _scale(raw_arr)
 
-    # Convert to array
-    raw_arr = _to_feature_array(clamped).reshape(1, -1)   # shape (1, 13)
-
-    # Scale
-    scaled_arr = _scale(raw_arr)
-
-    logger.debug("Preprocessed vector: %s", scaled_arr)
-    return scaled_arr
+    logger.debug("Preprocessed vector: %s", scaled)
+    return scaled
 
 
-def preprocess_dataframe(df: pd.DataFrame) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+def preprocess_dataframe(
+    df: pd.DataFrame,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Preprocess an entire DataFrame of patients (e.g., the training set).
 
     Parameters
     ----------
-    df : pd.DataFrame
-        Must contain all FEATURE_COLUMNS.  May also contain TARGET_COLUMN.
+    df : pd.DataFrame — must contain all FEATURE_COLUMNS.
+                        May also contain TARGET_COLUMN.
 
     Returns
     -------
@@ -315,14 +367,17 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[np.ndarray, Optional[np.ndar
     """
     df = df.copy()
 
-    # Extract labels before processing features
     y: Optional[np.ndarray] = None
     if TARGET_COLUMN in df.columns:
         y = df[TARGET_COLUMN].values.astype(int)
 
-    # Run each row through the pipeline
     records = df.to_dict(orient="records")
     processed_rows = []
+
+    logger.info(
+        "preprocess_dataframe: processing %d rows (row-by-row pipeline)",
+        len(records),
+    )
 
     for rec in records:
         coerced = _coerce_types(rec)
@@ -330,7 +385,7 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[np.ndarray, Optional[np.ndar
         clamped  = _clamp_ranges(imputed)
         processed_rows.append(_to_feature_array(clamped))
 
-    raw_X = np.vstack(processed_rows)          # shape (N, 13)
+    raw_X    = np.vstack(processed_rows)   # shape (N, 13)
     scaled_X = _scale(raw_X)
 
     logger.info("preprocess_dataframe: processed %d rows", len(scaled_X))
@@ -339,8 +394,7 @@ def preprocess_dataframe(df: pd.DataFrame) -> Tuple[np.ndarray, Optional[np.ndar
 
 def inverse_transform(scaled_array: np.ndarray) -> np.ndarray:
     """
-    Reverse the MinMax scaling — useful for displaying readable values
-    after internal computations.
+    Reverse the MinMax scaling.
 
     Parameters
     ----------
@@ -348,7 +402,7 @@ def inverse_transform(scaled_array: np.ndarray) -> np.ndarray:
 
     Returns
     -------
-    np.ndarray  same shape, values in original clinical units
+    np.ndarray  same shape, values in original clinical units.
     """
     scaler = _load_scaler()
     return scaler.inverse_transform(scaled_array)
@@ -360,8 +414,9 @@ def get_preprocessing_summary(patient: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns a human-readable dict showing the value of each feature
     at every stage of the pipeline.
+    Useful for the Data Entry debug pane in the UI.
 
-    Useful for the 'Data Entry' debug pane in the UI.
+    ADDED to Public API docstring (was missing from module header).
     """
     coerced = _coerce_types(patient)
     imputed  = _impute_missing(coerced)
@@ -369,7 +424,7 @@ def get_preprocessing_summary(patient: Dict[str, Any]) -> Dict[str, Any]:
     raw_arr  = _to_feature_array(clamped).reshape(1, -1)
     scaled   = _scale(raw_arr)[0]
 
-    summary = {}
+    summary: Dict[str, Any] = {}
     for i, col in enumerate(FEATURE_COLUMNS):
         summary[col] = {
             "raw":     patient.get(col),

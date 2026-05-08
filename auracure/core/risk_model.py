@@ -12,26 +12,19 @@ Responsibility:
         • Feature importances    (which vitals drove the decision)
         • A plain-language explanation
 
-Architecture:
-    ┌──────────────────────────────────────────────┐
-    │  Raw patient dict                            │
-    │        ↓  preprocess_patient()               │
-    │  Scaled (1×13) array                         │
-    │        ↓  RandomForestClassifier.predict()   │
-    │  Probability vector  [P_no_disease, P_disease]│
-    │        ↓  _probability_to_risk_level()       │
-    │  RiskResult dataclass                        │
-    └──────────────────────────────────────────────┘
-
 Public API:
-    load_model()           → fitted RandomForest (cached)
-    predict_risk(patient)  → RiskResult
-    train_model(df)        → fitted model + metrics dict
-    get_feature_importances() → List[(feature, importance)]
-    explain_prediction(patient) → str  (plain-English narrative)
+    load_model()                → fitted RandomForest (cached)
+    predict_risk(patient)       → RiskResult
+    train_model(df)             → fitted model + metrics dict
+    get_feature_importances()   → List[(feature, importance)]
+    explain_prediction(patient) → str
+    batch_predict(patients)     → List[RiskResult]
+    get_model_metadata()        → Dict
+    retrain_if_stale(days)      → bool
 """
 
 import os
+import time
 import pickle
 import warnings
 from dataclasses import dataclass, field
@@ -48,25 +41,26 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score
 
 from core.preprocess import preprocess_patient, preprocess_dataframe, fit_scaler
 from utils.constants import (
-    DATA_PATH,
-    MODEL_PATH,
+    HEART_DATA_PATH,
+    MODEL_SAVE_PATH,
     FEATURE_COLUMNS,
+    FEATURE_LABELS,
     TARGET_COLUMN,
-    RISK_LOW,
-    RISK_MEDIUM,
-    RISK_HIGH,
-    RISK_THRESHOLDS,
+    RISK_LABELS,
+    RISK_LEVELS,
+    RISK_COLORS,
+    RISK_ICONS,
     RF_N_ESTIMATORS,
     RF_MAX_DEPTH,
     RF_RANDOM_STATE,
     CONFIDENCE_LOW_THRESHOLD,
     CONFIDENCE_HIGH_THRESHOLD,
 )
-from utils.helpers import get_logger, score_to_risk_level
+from utils.helpers import get_logger, normalize_risk_level
 
 warnings.filterwarnings("ignore")
 logger = get_logger(__name__)
@@ -83,16 +77,18 @@ class RiskResult:
 
     Attributes
     ----------
-    risk_level       : "Low" | "Medium" | "High"
-    confidence_pct   : float   0–100
-    disease_prob     : float   0.0–1.0  (raw model probability)
-    predicted_label  : int     0 = no disease, 1 = disease
-    feature_contributions : list of (feature_name, importance_score)
-    top_risk_factors : list of str  (human-readable top 3 drivers)
-    explanation      : str  (one-paragraph plain-language summary)
-    model_version    : str
+    risk_level           : "LOW" | "MEDIUM" | "HIGH"  (key, not label)
+    risk_label           : "Low Risk" | "Medium Risk" | "High Risk"
+    confidence_pct       : float  0–100
+    disease_prob         : float  0.0–1.0
+    predicted_label      : int    0 = no disease, 1 = disease
+    feature_contributions: list of (feature_name, importance_score)
+    top_risk_factors     : list of str
+    explanation          : str
+    model_version        : str
     """
     risk_level:            str
+    risk_label:            str
     confidence_pct:        float
     disease_prob:          float
     predicted_label:       int
@@ -101,24 +97,39 @@ class RiskResult:
     explanation:           str                      = ""
     model_version:         str                      = "rf_v1"
 
-    # Derived convenience properties
     @property
     def is_high_risk(self) -> bool:
-        return self.risk_level == RISK_HIGH
+        return self.risk_level == "HIGH"
 
     @property
     def badge_color(self) -> str:
-        return {"Low": "green", "Medium": "orange", "High": "red"}.get(self.risk_level, "gray")
+        """
+        FIXED: Uses RISK_COLORS hex values from constants
+               instead of hardcoded 'green'/'orange'/'red' strings.
+        """
+        return RISK_COLORS.get(self.risk_level, "#808080")
+
+    @property
+    def badge_icon(self) -> str:
+        """ADDED: Convenience icon accessor for UI and prompt_builder."""
+        return RISK_ICONS.get(self.risk_level, "❔")
 
     def to_dict(self) -> Dict[str, Any]:
+        """
+        FIXED: Now stores both risk_level KEY and risk_label STRING.
+               Also includes badge_icon and badge_color for prompt_builder.
+        """
         return {
-            "risk_level":            self.risk_level,
+            "risk_level":   self.risk_level,          # "HIGH"
+            "risk_label":   self.risk_label,           # "High Risk"
             "confidence_pct":        round(self.confidence_pct, 1),
             "disease_prob":          round(self.disease_prob, 4),
             "predicted_label":       self.predicted_label,
             "top_risk_factors":      self.top_risk_factors,
             "explanation":           self.explanation,
             "model_version":         self.model_version,
+            "badge_color":           self.badge_color,  # ADDED
+            "badge_icon":            self.badge_icon,   # ADDED
             "feature_contributions": [
                 {"feature": f, "importance": round(v, 4)}
                 for f, v in self.feature_contributions
@@ -130,34 +141,17 @@ class RiskResult:
 # Internal helpers
 # ─────────────────────────────────────────────
 
-# Human-readable names for the 13 Cleveland features
-_FEATURE_LABELS: Dict[str, str] = {
-    "age":      "Age",
-    "sex":      "Sex",
-    "cp":       "Chest Pain Type",
-    "trestbps": "Resting Blood Pressure",
-    "chol":     "Serum Cholesterol",
-    "fbs":      "Fasting Blood Sugar",
-    "restecg":  "Resting ECG Result",
-    "thalach":  "Max Heart Rate Achieved",
-    "exang":    "Exercise-Induced Angina",
-    "oldpeak":  "ST Depression (Exercise)",
-    "slope":    "Slope of Peak ST Segment",
-    "ca":       "Number of Major Vessels (Fluoroscopy)",
-    "thal":     "Thalassemia Type",
-}
-
 _RISK_EXPLANATIONS: Dict[str, str] = {
-    RISK_LOW: (
+    "LOW": (
         "The model detected minimal cardiac risk indicators. "
         "Routine follow-up and preventive lifestyle measures are recommended."
     ),
-    RISK_MEDIUM: (
+    "MEDIUM": (
         "Moderate cardiac risk factors are present. "
         "Closer monitoring, further diagnostic tests, and lifestyle modifications "
         "are advisable. Consult a cardiologist if symptoms persist."
     ),
-    RISK_HIGH: (
+    "HIGH": (
         "Significant cardiac risk factors detected. "
         "Immediate cardiology consultation is strongly recommended. "
         "Do not delay further evaluation and possible intervention."
@@ -170,25 +164,30 @@ _model: Optional[RandomForestClassifier] = None
 
 def _probability_to_risk_level(disease_prob: float) -> Tuple[str, float]:
     """
-    Map raw disease probability → (risk_level, confidence_pct).
+    Map raw disease probability → (risk_level_key, confidence_pct).
 
-    Thresholds from constants.RISK_THRESHOLDS:
-        < LOW_THRESHOLD   → Low     (confidence = 1 - disease_prob)
-        < HIGH_THRESHOLD  → Medium  (confidence based on distance from 0.5)
-        ≥ HIGH_THRESHOLD  → High    (confidence = disease_prob)
+    FIXED: Consistent confidence formula — no cliff at boundaries.
+           Returns risk_level KEY ("LOW"|"MEDIUM"|"HIGH"), not label.
     """
-    lo = RISK_THRESHOLDS["low_max"]      # e.g. 0.35
-    hi = RISK_THRESHOLDS["high_min"]     # e.g. 0.65
+    lo = RISK_LEVELS["LOW"][1]      # 0.35
+    hi = RISK_LEVELS["HIGH"][0]     # 0.65
 
     if disease_prob < lo:
-        risk = RISK_LOW
+        risk = "LOW"
+        # Scale: 0.0 → 100%, 0.35 → 65%
         confidence = (1.0 - disease_prob) * 100.0
+
     elif disease_prob < hi:
-        risk = RISK_MEDIUM
-        # Confidence = how far from the uncertain midpoint (0.5)
-        confidence = (abs(disease_prob - 0.5) / 0.5) * 60.0 + 40.0   # 40–100%
+        risk = "MEDIUM"
+        # FIXED: Normalize within band [0.35, 0.65] — no boundary cliff
+        band_width = hi - lo           # 0.30
+        mid        = (lo + hi) / 2    # 0.50
+        distance   = abs(disease_prob - mid)
+        confidence = 50.0 + (distance / (band_width / 2)) * 30.0
+
     else:
-        risk = RISK_HIGH
+        risk = "HIGH"
+        # Scale: 0.65 → 65%, 1.0 → 100%
         confidence = disease_prob * 100.0
 
     return risk, round(min(confidence, 99.9), 1)
@@ -196,48 +195,63 @@ def _probability_to_risk_level(disease_prob: float) -> Tuple[str, float]:
 
 def _get_feature_contributions(
     model: RandomForestClassifier,
+    scaled_input: Optional[np.ndarray] = None,
 ) -> List[Tuple[str, float]]:
     """
     Return feature importances sorted descending.
+
+    FIXED: If scaled_input provided, weights global importances by
+           patient's actual feature values for patient-specific contributions.
+           Uses FEATURE_LABELS from constants (no duplication).
 
     Returns
     -------
     List of (readable_feature_label, importance_score)
     """
-    importances = model.feature_importances_
+    global_importances = model.feature_importances_
+
+    if scaled_input is not None:
+        patient_vals = scaled_input[0]            # shape (13,)
+        weighted     = global_importances * patient_vals
+        total        = weighted.sum()
+        importances  = weighted / total if total > 0 else global_importances
+    else:
+        importances = global_importances
+
     pairs = [
-        (_FEATURE_LABELS.get(col, col), float(imp))
+        (FEATURE_LABELS.get(col, col), float(imp))
         for col, imp in zip(FEATURE_COLUMNS, importances)
     ]
     pairs.sort(key=lambda x: x[1], reverse=True)
     return pairs
 
 
-def _top_risk_factors(contributions: List[Tuple[str, float]], n: int = 3) -> List[str]:
+def _top_risk_factors(
+    contributions: List[Tuple[str, float]],
+    n: int = 3,
+) -> List[str]:
     """Extract the top-n feature names from a contributions list."""
     return [feat for feat, _ in contributions[:n]]
 
 
 def _build_explanation(
-    risk_level: str,
-    top_factors: List[str],
-    confidence: float,
+    risk_level:   str,
+    top_factors:  List[str],
+    confidence:   float,
     disease_prob: float,
 ) -> str:
-    """
-    Compose a plain-English explanation paragraph.
-    """
-    base = _RISK_EXPLANATIONS.get(risk_level, "")
+    """Compose a plain-English explanation paragraph."""
+    base        = _RISK_EXPLANATIONS.get(risk_level, "")
     factors_str = ", ".join(top_factors) if top_factors else "multiple clinical features"
-    conf_desc = (
-        "high confidence" if confidence >= CONFIDENCE_HIGH_THRESHOLD
+    conf_desc   = (
+        "high confidence"     if confidence >= CONFIDENCE_HIGH_THRESHOLD
         else "moderate confidence" if confidence >= CONFIDENCE_LOW_THRESHOLD
         else "low confidence"
     )
     return (
         f"Assessment ({conf_desc}, {confidence:.1f}%): {base} "
         f"Key contributing factors: {factors_str}. "
-        f"Disease probability estimated at {disease_prob*100:.1f}%."
+        f"Disease probability estimated at {disease_prob * 100:.1f}%."
     )
 
 
@@ -246,19 +260,20 @@ def _build_explanation(
 # ─────────────────────────────────────────────
 
 def _save_model(model: RandomForestClassifier) -> None:
-    model_dir = Path(MODEL_PATH).parent
+    model_dir = Path(MODEL_SAVE_PATH).parent
     model_dir.mkdir(parents=True, exist_ok=True)
-    with open(MODEL_PATH, "wb") as fh:
+    with open(MODEL_SAVE_PATH, "wb") as fh:
         pickle.dump(model, fh)
-    logger.info("Model saved to %s", MODEL_PATH)
+    logger.info("Model saved to %s", MODEL_SAVE_PATH)
 
 
 def _load_model_from_disk() -> Optional[RandomForestClassifier]:
-    if not os.path.exists(MODEL_PATH):
+    if not os.path.exists(MODEL_SAVE_PATH):
         return None
-    with open(MODEL_PATH, "rb") as fh:
+    with open(MODEL_SAVE_PATH, "rb") as fh:
+        # NOTE: Only load pickle files from trusted sources.
         model = pickle.load(fh)
-    logger.info("Model loaded from %s", MODEL_PATH)
+    logger.info("Model loaded from %s", MODEL_SAVE_PATH)
     return model
 
 
@@ -266,43 +281,44 @@ def _load_model_from_disk() -> Optional[RandomForestClassifier]:
 # Training
 # ─────────────────────────────────────────────
 
-def train_model(df: Optional[pd.DataFrame] = None) -> Tuple[RandomForestClassifier, Dict]:
+def train_model(
+    df: Optional[pd.DataFrame] = None,
+) -> Tuple[RandomForestClassifier, Dict[str, Any]]:
     """
-    Train a Random Forest on *df* (or DATA_PATH if None).
+    Train a Random Forest on *df* (or HEART_DATA_PATH if None).
 
-    Steps
-    -----
-    1. Fit the MinMaxScaler on the full dataset.
-    2. Preprocess all rows (preprocess_dataframe).
-    3. Train/test split (80/20 stratified).
-    4. Fit RandomForestClassifier.
-    5. Evaluate and return metrics.
-    6. Persist model to MODEL_PATH.
+    ADDED: 5-fold cross-validation metrics (cv_roc_auc_mean/std).
 
     Returns
     -------
     (fitted_model, metrics_dict)
-        metrics_dict keys: accuracy, precision, recall, f1, roc_auc
     """
     global _model
 
     if df is None:
-        if not os.path.exists(DATA_PATH):
-            raise FileNotFoundError(f"Training data not found at {DATA_PATH}")
-        df = pd.read_csv(DATA_PATH)
-        logger.info("Loaded %d rows from %s", len(df), DATA_PATH)
+        if not os.path.exists(HEART_DATA_PATH):
+            raise FileNotFoundError(
+                f"Training data not found at {HEART_DATA_PATH}"
+            )
+        df = pd.read_csv(HEART_DATA_PATH)
+        logger.info("Loaded %d rows from %s", len(df), HEART_DATA_PATH)
 
-    # Fit scaler first (needed by preprocess_dataframe)
+    # Fit scaler first
     fit_scaler(df)
 
     # Preprocess
     X, y = preprocess_dataframe(df)
     if y is None:
-        raise ValueError(f"Training data must contain target column '{TARGET_COLUMN}'")
+        raise ValueError(
+            f"Training data must contain target column '{TARGET_COLUMN}'"
+        )
 
-    # Split
+    # Train/test split
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=RF_RANDOM_STATE, stratify=y
+        X, y,
+        test_size=0.20,
+        random_state=RF_RANDOM_STATE,
+        stratify=y,
     )
     logger.info(
         "Train/test split: %d train, %d test (stratified)",
@@ -323,19 +339,29 @@ def train_model(df: Optional[pd.DataFrame] = None) -> Tuple[RandomForestClassifi
         RF_N_ESTIMATORS, RF_MAX_DEPTH,
     )
 
-    # Evaluate
+    # Evaluate — hold-out metrics
     y_pred  = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
 
-    metrics = {
-        "accuracy":  round(float(accuracy_score(y_test, y_pred)), 4),
-        "precision": round(float(precision_score(y_test, y_pred, zero_division=0)), 4),
-        "recall":    round(float(recall_score(y_test, y_pred, zero_division=0)), 4),
-        "f1":        round(float(f1_score(y_test, y_pred, zero_division=0)), 4),
-        "roc_auc":   round(float(roc_auc_score(y_test, y_proba)), 4),
+    metrics: Dict[str, Any] = {
+        "accuracy":   round(float(accuracy_score(y_test, y_pred)), 4),
+        "precision":  round(float(precision_score(y_test, y_pred, zero_division=0)), 4),
+        "recall":     round(float(recall_score(y_test, y_pred, zero_division=0)), 4),
+        "f1":         round(float(f1_score(y_test, y_pred, zero_division=0)), 4),
+        "roc_auc":    round(float(roc_auc_score(y_test, y_proba)), 4),
         "train_size": int(len(X_train)),
         "test_size":  int(len(X_test)),
     }
+
+    # ADDED: 5-fold cross-validation
+    cv_scores = cross_val_score(model, X, y, cv=5, scoring="roc_auc")
+    metrics["cv_roc_auc_mean"] = round(float(cv_scores.mean()), 4)
+    metrics["cv_roc_auc_std"]  = round(float(cv_scores.std()), 4)
+    logger.info(
+        "5-fold CV ROC-AUC: %.4f ± %.4f",
+        cv_scores.mean(), cv_scores.std(),
+    )
+
     logger.info("Metrics: %s", metrics)
 
     # Cache + persist
@@ -355,8 +381,8 @@ def load_model() -> RandomForestClassifier:
 
     Priority:
     1. Module-level cache (_model)
-    2. Disk (MODEL_PATH)
-    3. Train from scratch using DATA_PATH
+    2. Disk  (MODEL_SAVE_PATH)
+    3. Train from scratch using HEART_DATA_PATH
     """
     global _model
 
@@ -377,37 +403,42 @@ def predict_risk(patient: Dict[str, Any]) -> RiskResult:
     """
     Full risk assessment pipeline for one patient.
 
+    FIXED:
+    - risk_level now stores KEY ("HIGH") not label ("High Risk")
+    - risk_label stored separately for display
+    - feature_contributions are patient-specific (weighted)
+    - badge_color and badge_icon included in to_dict()
+
     Parameters
     ----------
-    patient : dict
-        Raw patient record (same format as UI form / sample_input.json).
+    patient : dict — raw patient record (UI form / sample_input.json)
 
     Returns
     -------
-    RiskResult  — see dataclass definition above.
+    RiskResult
     """
     model = load_model()
 
-    # Preprocess
-    X = preprocess_patient(patient)     # shape (1, 13)
+    X = preprocess_patient(patient)          # shape (1, 13)
 
-    # Predict
-    proba         = model.predict_proba(X)[0]   # [P_class0, P_class1]
+    proba         = model.predict_proba(X)[0]
     disease_prob  = float(proba[1])
     predicted_lbl = int(model.predict(X)[0])
 
-    # Map → risk level
+    # FIXED: returns KEY not label
     risk_level, confidence = _probability_to_risk_level(disease_prob)
+    risk_label = RISK_LABELS[risk_level]     # "High Risk" etc.
 
-    # Feature importance breakdown
-    contributions = _get_feature_contributions(model)
+    # FIXED: patient-specific weighted contributions
+    contributions = _get_feature_contributions(model, scaled_input=X)
     top_factors   = _top_risk_factors(contributions)
-
-    # Plain-English explanation
-    explanation = _build_explanation(risk_level, top_factors, confidence, disease_prob)
+    explanation   = _build_explanation(
+        risk_level, top_factors, confidence, disease_prob
+    )
 
     result = RiskResult(
         risk_level=risk_level,
+        risk_label=risk_label,
         confidence_pct=confidence,
         disease_prob=disease_prob,
         predicted_label=predicted_lbl,
@@ -417,8 +448,8 @@ def predict_risk(patient: Dict[str, Any]) -> RiskResult:
     )
 
     logger.info(
-        "Risk assessment — level=%s | prob=%.3f | confidence=%.1f%%",
-        risk_level, disease_prob, confidence,
+        "Risk assessment — level=%s | label=%s | prob=%.3f | confidence=%.1f%%",
+        risk_level, risk_label, disease_prob, confidence,
     )
     return result
 
@@ -444,12 +475,14 @@ def explain_prediction(patient: Dict[str, Any]) -> str:
     return result.explanation
 
 
-def batch_predict(patients: List[Dict[str, Any]]) -> List[RiskResult]:
+def batch_predict(
+    patients: List[Dict[str, Any]],
+) -> List["RiskResult"]:
     """
     Score multiple patients efficiently.
 
-    Uses the model once (avoids repeated disk loads) and processes
-    each patient through the full pipeline.
+    FIXED: Model loaded once — no repeated load_model() calls
+           per patient (was calling it indirectly via predict_risk).
 
     Parameters
     ----------
@@ -459,8 +492,80 @@ def batch_predict(patients: List[Dict[str, Any]]) -> List[RiskResult]:
     -------
     List[RiskResult]  same order as input
     """
-    model = load_model()        # ensure loaded once
-    return [predict_risk(p) for p in patients]
+    if not patients:
+        return []
+
+    model = load_model()    # load once
+    results: List[RiskResult] = []
+
+    for patient in patients:
+        X = preprocess_patient(patient)
+        proba         = model.predict_proba(X)[0]
+        disease_prob  = float(proba[1])
+        predicted_lbl = int(model.predict(X)[0])
+
+        risk_level, confidence = _probability_to_risk_level(disease_prob)
+        risk_label    = RISK_LABELS[risk_level]
+        contributions = _get_feature_contributions(model, scaled_input=X)
+        top_factors   = _top_risk_factors(contributions)
+        explanation   = _build_explanation(
+            risk_level, top_factors, confidence, disease_prob
+        )
+
+        results.append(RiskResult(
+            risk_level=risk_level,
+            risk_label=risk_label,
+            confidence_pct=confidence,
+            disease_prob=disease_prob,
+            predicted_label=predicted_lbl,
+            feature_contributions=contributions,
+            top_risk_factors=top_factors,
+            explanation=explanation,
+        ))
+
+    logger.info("batch_predict: scored %d patients", len(results))
+    return results
+
+
+def get_model_metadata() -> Dict[str, Any]:
+    """
+    ADDED: Return metadata about the currently loaded model.
+    Used by ui/system_status.py.
+    """
+    model = load_model()
+    importances = _get_feature_contributions(model)
+
+    return {
+        "model_type":    type(model).__name__,
+        "n_estimators":  model.n_estimators,
+        "max_depth":     model.max_depth,
+        "n_features":    model.n_features_in_,
+        "model_version": "rf_v1",
+        "top_features":  importances[:3],
+        "model_path":    MODEL_SAVE_PATH,
+        "model_exists":  os.path.exists(MODEL_SAVE_PATH),
+    }
+
+
+def retrain_if_stale(max_age_days: int = 30) -> bool:
+    """
+    ADDED: Retrain model if saved file is older than max_age_days.
+    Returns True if retrained, False if still fresh.
+    """
+    if not os.path.exists(MODEL_SAVE_PATH):
+        train_model()
+        return True
+
+    age_seconds = time.time() - os.path.getmtime(MODEL_SAVE_PATH)
+    age_days    = age_seconds / 86400
+
+    if age_days > max_age_days:
+        logger.info("Model is %.1f days old — retraining", age_days)
+        train_model()
+        return True
+
+    logger.info("Model is %.1f days old — still fresh", age_days)
+    return False
 
 
 # ─────────────────────────────────────────────

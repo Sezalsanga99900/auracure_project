@@ -5,6 +5,8 @@
     "note": "All values are fictional and for demonstration purposes only."
   },
   "patient": {
+    "name": "John Doe",
+    "symptoms": "Chest discomfort during exercise, mild shortness of breath, occasional palpitations",
     "age": 54,
     "sex": 1,
     "cp": 2,

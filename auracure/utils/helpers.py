@@ -32,6 +32,16 @@ from utils.constants import (
     FEATURE_LABELS,
     UNKNOWN_LABEL,
     NA_PLACEHOLDER,
+    ROLE_PERMISSIONS,
+    SAMPLE_INPUT_PATH,
+    MODEL_SAVE_PATH,
+    SCALER_SAVE_PATH,
+    UI_SUCCESS_COLOR,
+    UI_WARNING_COLOR,
+    MODE_ONLINE,
+    MODE_OFFLINE,
+    MODE_ONLINE_LABEL,
+    MODE_OFFLINE_LABEL,
 )
 
 # =============================================================================
@@ -45,11 +55,10 @@ def get_logger(name: str) -> logging.Logger:
     """
     logger = logging.getLogger(name)
 
-    if logger.handlers:          # avoid duplicate handlers on re-import
+    if logger.handlers:
         return logger
 
     logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-
     formatter = logging.Formatter(LOG_FORMAT)
 
     # Console handler
@@ -63,7 +72,7 @@ def get_logger(name: str) -> logging.Logger:
         fh.setFormatter(formatter)
         logger.addHandler(fh)
     except OSError:
-        pass   # silently skip file logging if path is not writable
+        pass
 
     return logger
 
@@ -129,13 +138,12 @@ def score_to_risk_level(score: float) -> str:
     for level, (lo, hi) in RISK_LEVELS.items():
         if lo <= score < hi:
             return level
-    return "HIGH"   # fallback for score == 1.0
+    return "HIGH"
 
 
 def risk_badge(score: float) -> Dict[str, str]:
     """
     Returns a dict with label, color, and icon for a risk score.
-    Useful for building UI badge components.
 
     Returns:
         {
@@ -156,18 +164,70 @@ def risk_badge(score: float) -> Dict[str, str]:
     }
 
 
+def normalize_risk_level(raw: Optional[str]) -> Optional[str]:
+    """
+    ADDED: Normalize risk level — converts label or key → key.
+
+    Handles both:
+        "High Risk"  → "HIGH"   (label → key)
+        "HIGH"       → "HIGH"   (key   → key)
+
+    Used across ai/ modules to fix key/label confusion.
+    """
+    if not raw:
+        return None
+    if raw in RISK_LEVELS:
+        return raw                                  # already a key
+    label_to_key = {v: k for k, v in RISK_LABELS.items()}
+    return label_to_key.get(raw, raw.upper())
+
+
+# =============================================================================
+# ROLE & PERMISSION HELPERS
+# =============================================================================
+
+def has_permission(role: str, permission: str) -> bool:
+    """
+    Check if a role has a specific permission.
+
+    Args:
+        role       : role key e.g. 'doctor', 'nurse'
+        permission : permission string e.g. 'view_analytics'
+
+    Returns:
+        True if role exists and has permission, False otherwise.
+    """
+    if not role or not permission:
+        return False
+    perms = ROLE_PERMISSIONS.get(role.lower(), [])
+    return permission in perms
+
+
+def get_role_permissions(role: str) -> List[str]:
+    """
+    Get all permissions for a specific role.
+
+    Args:
+        role : role key
+
+    Returns:
+        List of permission strings, empty list if role not found.
+    """
+    return ROLE_PERMISSIONS.get(role.lower(), [])
+
+
 # =============================================================================
 # DICT / PATIENT RECORD HELPERS
 # =============================================================================
 
-def flatten_dict(d: Dict, prefix: str = "", sep: str = ".") -> Dict:
+def flatten_dict(d: Dict[str, Any], prefix: str = "", sep: str = ".") -> Dict[str, Any]:
     """
     Recursively flatten a nested dict.
 
     Example:
         {"a": {"b": 1}} → {"a.b": 1}
     """
-    items: Dict = {}
+    items: Dict[str, Any] = {}
     for k, v in d.items():
         new_key = f"{prefix}{sep}{k}" if prefix else k
         if isinstance(v, dict):
@@ -177,13 +237,13 @@ def flatten_dict(d: Dict, prefix: str = "", sep: str = ".") -> Dict:
     return items
 
 
-def safe_get(d: Dict, key: str, default: Any = None) -> Any:
+def safe_get(d: Dict[str, Any], key: str, default: Any = None) -> Any:
     """dict.get() with a fallback that also handles None values."""
     val = d.get(key, default)
     return default if val is None else val
 
 
-def strip_none(d: Dict) -> Dict:
+def strip_none(d: Dict[str, Any]) -> Dict[str, Any]:
     """Remove keys whose value is None from a dict (shallow)."""
     return {k: v for k, v in d.items() if v is not None}
 
@@ -194,13 +254,12 @@ def patient_to_display(patient: PatientDict) -> Dict[str, str]:
     for display in the UI results panel.
 
     Example:
-        {"cp": 2, "age": 54, ...} → {"Chest Pain Type": "Non-Anginal Pain", ...}
+        {"cp": 2, "age": 54} → {"Chest Pain Type": "Non-Anginal Pain", ...}
     """
     display: Dict[str, str] = {}
     for key, value in patient.items():
         label = FEATURE_LABELS.get(key, key.replace("_", " ").title())
 
-        # Decode coded fields
         if key == "cp":
             value = CHEST_PAIN_LABELS.get(int(value), UNKNOWN_LABEL)
         elif key == "thal":
@@ -226,7 +285,7 @@ def patient_to_display(patient: PatientDict) -> Dict[str, str]:
 
 def now_str() -> str:
     """Current UTC timestamp as a formatted string."""
-    return datetime.datetime.utcnow().strftime(DATE_FORMAT)
+    return datetime.datetime.now(datetime.timezone.utc).strftime(DATE_FORMAT)
 
 
 def ts_to_str(ts: datetime.datetime) -> str:
@@ -244,14 +303,16 @@ def str_to_ts(s: str) -> Optional[datetime.datetime]:
 
 def elapsed_seconds(start: datetime.datetime) -> float:
     """Seconds elapsed since *start* (UTC)."""
-    return (datetime.datetime.utcnow() - start).total_seconds()
+    return (
+        datetime.datetime.now(datetime.timezone.utc) - start
+    ).total_seconds()
 
 
 # =============================================================================
 # FILE / IO HELPERS
 # =============================================================================
 
-def load_json(path: str) -> Optional[Dict]:
+def load_json(path: str) -> Optional[Dict[str, Any]]:
     """
     Load a JSON file and return its contents as a dict.
     Returns None if the file does not exist or cannot be parsed.
@@ -269,7 +330,7 @@ def load_json(path: str) -> Optional[Dict]:
 
 def save_json(data: Any, path: str, indent: int = 2) -> bool:
     """
-    Save *data* to a JSON file.  Creates parent directories if needed.
+    Save *data* to a JSON file. Creates parent directories if needed.
     Returns True on success, False on failure.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -307,6 +368,24 @@ def file_exists(path: str) -> bool:
     return os.path.isfile(path)
 
 
+def load_sample_input() -> Optional[Dict[str, Any]]:
+    """
+    Load the sample patient input from JSON (data/sample_input.json).
+    Convenience wrapper for quick testing.
+    """
+    return load_json(SAMPLE_INPUT_PATH)
+
+
+def model_files_exist() -> Tuple[bool, bool]:
+    """
+    Check if pre-trained model and scaler files exist.
+
+    Returns:
+        Tuple of (model_exists, scaler_exists)
+    """
+    return file_exists(MODEL_SAVE_PATH), file_exists(SCALER_SAVE_PATH)
+
+
 # =============================================================================
 # STRING HELPERS
 # =============================================================================
@@ -340,17 +419,17 @@ def hash_string(text: str) -> str:
 # DATAFRAME / NUMPY HELPERS
 # =============================================================================
 
-def df_to_records(df: pd.DataFrame) -> List[Dict]:
+def df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """Convert a DataFrame to a list of dicts (orient='records')."""
     return df.to_dict(orient="records")
 
 
-def records_to_df(records: List[Dict]) -> pd.DataFrame:
+def records_to_df(records: List[Dict[str, Any]]) -> pd.DataFrame:
     """Convert a list of dicts back to a DataFrame."""
     return pd.DataFrame(records)
 
 
-def series_to_dict(s: pd.Series) -> Dict:
+def series_to_dict(s: pd.Series) -> Dict[str, Any]:
     """Convert a pandas Series to a plain dict."""
     return s.to_dict()
 
@@ -385,8 +464,8 @@ def fill_missing(
     Fill NaN values in *df*.
 
     Args:
-        strategy: 'median' | 'mean' | 'zero' | 'mode'
-        columns:  list of column names to fill; defaults to all numeric cols.
+        strategy : 'median' | 'mean' | 'zero' | 'mode'
+        columns  : list of column names to fill; defaults to all numeric cols.
 
     Returns a new DataFrame.
     """
@@ -397,14 +476,14 @@ def fill_missing(
         if col not in df.columns:
             continue
         if strategy == "median":
-            df[col].fillna(df[col].median(), inplace=True)
+            df[col] = df[col].fillna(df[col].median())
         elif strategy == "mean":
-            df[col].fillna(df[col].mean(), inplace=True)
+            df[col] = df[col].fillna(df[col].mean())
         elif strategy == "zero":
-            df[col].fillna(0, inplace=True)
+            df[col] = df[col].fillna(0)
         elif strategy == "mode":
             mode_val = df[col].mode()
-            df[col].fillna(mode_val[0] if not mode_val.empty else 0, inplace=True)
+            df[col] = df[col].fillna(mode_val[0] if not mode_val.empty else 0)
         else:
             raise ValueError(f"Unknown fill strategy: {strategy!r}")
 
@@ -421,7 +500,7 @@ def format_score(score: float) -> str:
 
 
 def format_similarity(sim: float) -> str:
-    """Format a similarity score, e.g. '0.8742 → 87.42% match'."""
+    """Format a similarity score, e.g. '87.4% match'."""
     return f"{sim * 100:.1f}% match"
 
 
@@ -433,6 +512,32 @@ def format_patient_id(patient_id: Union[int, str]) -> str:
 def bullet_list(items: List[str], bullet: str = "•") -> str:
     """Join a list of strings into a bullet-separated display string."""
     return "\n".join(f"{bullet} {item}" for item in items)
+
+
+def format_mode(mode: str) -> Dict[str, Any]:
+    """
+    Format online/offline mode for UI display.
+    FIXED: Now uses MODE_ONLINE_LABEL / MODE_OFFLINE_LABEL from constants.
+
+    Returns:
+        Dict with label, color, icon, is_online, badge_class
+    """
+    mode = mode.lower()
+    if mode == MODE_ONLINE:
+        return {
+            "label":       MODE_ONLINE_LABEL,
+            "color":       UI_SUCCESS_COLOR,
+            "icon":        "🌐",
+            "is_online":   True,
+            "badge_class": "online-badge",
+        }
+    return {
+        "label":       MODE_OFFLINE_LABEL,
+        "color":       UI_WARNING_COLOR,
+        "icon":        "📴",
+        "is_online":   False,
+        "badge_class": "offline-badge",
+    }
 
 
 # =============================================================================
@@ -460,7 +565,8 @@ def require_env(key: str) -> str:
 
 def mask_key(key: str, visible: int = 4) -> str:
     """
-    Mask an API key for safe logging, e.g. 'sk-ab...1234' → 'sk-ab****1234'.
+    Mask an API key for safe logging.
+    e.g. 'sk-abcd1234efgh5678' → 'sk-a****5678'
     """
     if len(key) <= visible * 2:
         return "*" * len(key)
@@ -475,15 +581,24 @@ def check_dependencies() -> Tuple[bool, List[str]]:
     """
     Verify that all required Python packages are importable.
     Returns (all_ok: bool, missing: List[str]).
+
+    FIXED: Corrected package import names.
     """
-    required = [
-        "streamlit", "pandas", "numpy", "sklearn",
-        "plotly", "requests", "dotenv",
-    ]
+    required = {
+        "streamlit":   "streamlit",
+        "pandas":      "pandas",
+        "numpy":       "numpy",
+        "sklearn":     "sklearn",
+        "plotly":      "plotly",
+        "requests":    "requests",
+        "dotenv":      "dotenv",
+        "groq":        "groq",
+        "openai":      "openai",
+    }
     missing = []
-    for pkg in required:
+    for display_name, import_name in required.items():
         try:
-            __import__(pkg.replace("-", "_"))
+            __import__(import_name)
         except ImportError:
-            missing.append(pkg)
+            missing.append(display_name)
     return len(missing) == 0, missing

@@ -105,10 +105,11 @@ done
 # ══════════════════════════════════════════════════════════════════════
 step "4" "Creating required directories"
 
+# FIXED: models/ not data/models/ (matches constants.py MODEL_SAVE_PATH)
 DIRS=(
-    "data/exports"
-    "data/models"
+    "data"
     "database"
+    "models"
     "assets"
     "logs"
 )
@@ -141,18 +142,22 @@ GROQ_API_KEY=your_groq_api_key_here
 OPENAI_API_KEY=your_openai_api_key_here
 
 # ── Firebase (Cloud Sync) ───────────────────────────────
-# Download from Firebase Console → Project Settings → Service Accounts
-FIREBASE_PROJECT_ID=your_firebase_project_id
-FIREBASE_CREDENTIALS_PATH=data/firebase_credentials.json
+# Option A: Path to service account JSON file
+GOOGLE_APPLICATION_CREDENTIALS=database/firebase_credentials.json
+
+# Option B: Or paste JSON directly (for containerized deployments)
+# FIREBASE_SERVICE_ACCOUNT_JSON='{"type": "service_account", ...}'
+
+# ── Admin Account (created on first run if no users exist)
+# If ADMIN_PASSWORD is not set, a secure random password will be
+# generated and displayed in the console on first run.
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=your_secure_admin_password
 
 # ── App Configuration ────────────────────────────────────
 APP_ENV=development
 DEBUG=false
 LOG_LEVEL=INFO
-
-# ── Database Paths ───────────────────────────────────────
-LOCAL_DB_PATH=database/auraecho.db
-AUTH_DB_PATH=database/auth.db
 EOF
     success ".env file created — add your API keys before running"
 fi
@@ -163,23 +168,56 @@ fi
 step "6" "Training cardiac risk model"
 
 if [ ! -f "data/heart_data.csv" ]; then
-    warning "heart_data.csv not found in data/ — model training skipped"
-    warning "Add heart_data.csv and run: python3 -c \"from core.risk_model import train_model; train_model()\""
+    warning "data/heart_data.csv not found — model training skipped"
+    warning "Add data/heart_data.csv and re-run setup, or model will train on first app run"
 else
-    info "Training Random Forest model on heart_data.csv..."
+    info "Training Random Forest model on data/heart_data.csv..."
+    
+    # Run training in activated venv
     python3 -c "
+import sys
+sys.path.insert(0, '.')
 from core.risk_model import train_model
-import json
 
-model, metrics = train_model()
-print('  Model metrics:')
-for k, v in metrics.items():
-    if isinstance(v, float):
-        print(f'    {k}: {v:.4f}')
-    else:
-        print(f'    {k}: {v}')
-" && success "Model trained and saved to data/models/" \
-  || warning "Model training failed — will train on first app run"
+try:
+    model, metrics = train_model()
+    print('  ✓ Model trained successfully')
+    print('  Metrics:')
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            print(f'    • {k}: {v:.4f}')
+        else:
+            print(f'    • {k}: {v}')
+except Exception as e:
+    print(f'  ✗ Training failed: {e}', file=sys.stderr)
+    sys.exit(1)
+" && success "Model saved to models/risk_model.pkl" \
+  || warning "Model training failed — will train automatically on first app run"
+fi
+
+# Create sample input if missing
+if [ ! -f "data/sample_input.json" ]; then
+    info "Creating sample input file..."
+    cat > data/sample_input.json << 'EOF'
+{
+    "name": "John Doe",
+    "age": 58,
+    "sex": 1,
+    "cp": 2,
+    "trestbps": 130,
+    "chol": 240,
+    "fbs": 0,
+    "restecg": 1,
+    "thalach": 140,
+    "exang": 0,
+    "oldpeak": 1.5,
+    "slope": 1,
+    "ca": 1,
+    "thal": 2,
+    "symptoms": "Occasional chest discomfort during exercise"
+}
+EOF
+    success "Sample input created at data/sample_input.json"
 fi
 
 # ══════════════════════════════════════════════════════════════════════
@@ -189,7 +227,15 @@ step "7" "Checking Ollama (offline AI)"
 
 if command -v ollama &>/dev/null; then
     success "Ollama is installed"
-
+    
+    # FIXED: Check if ollama service is running
+    if curl -s http://localhost:11434/api/tags &>/dev/null; then
+        success "Ollama service is running"
+    else
+        warning "Ollama service is not running"
+        info "  Start Ollama with: ollama serve"
+    fi
+    
     # Check if llama3 model is pulled
     if ollama list 2>/dev/null | grep -q "llama3"; then
         success "llama3 model is available"
@@ -212,17 +258,22 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-# STEP 8 — Verify Firebase credentials
+# STEP 8 — Check Firebase credentials
 # ══════════════════════════════════════════════════════════════════════
 step "8" "Checking Firebase configuration"
 
-if [ -f "data/firebase_credentials.json" ]; then
-    success "Firebase credentials found at data/firebase_credentials.json"
+# FIXED: Check correct path and env var
+if [ -f "database/firebase_credentials.json" ]; then
+    success "Firebase credentials found at database/firebase_credentials.json"
+elif [ -f "data/firebase_credentials.json" ]; then
+    warning "Found credentials at data/firebase_credentials.json"
+    info "  Consider moving to database/firebase_credentials.json"
 else
     warning "Firebase credentials not found"
     info "  Cloud sync will be disabled until credentials are added"
     info "  Download from: Firebase Console → Project Settings → Service Accounts"
-    info "  Save as: data/firebase_credentials.json"
+    info "  Save as: database/firebase_credentials.json"
+    info "  Or set GOOGLE_APPLICATION_CREDENTIALS in .env"
 fi
 
 # ══════════════════════════════════════════════════════════════════════
@@ -251,9 +302,8 @@ echo ""
 echo "  4. Open in browser"
 echo "     ${CYAN}http://localhost:8501${NC}"
 echo ""
-echo -e "${YELLOW}Demo login credentials:${NC}"
-echo "  Doctor: admin_doctor / Doctor@123"
-echo "  Nurse:  nurse_demo   / Nurse@123"
+echo -e "${YELLOW}First-time login:${NC}"
+echo "  On first run, a default admin account will be created."
+echo "  Check the console for the generated password if ADMIN_PASSWORD is not set in .env"
 echo ""
 echo -e "${BOLD}${GREEN}Happy diagnosing! ❤️${NC}"
-

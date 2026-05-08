@@ -1,474 +1,583 @@
-"""
-ui/dashboard.py
-─────────────────────────────────────────────────────────────────
-AuraCure — Analytics Dashboard (Online Mode Only)
-Purpose : Renders interactive Plotly charts using saved patient
-          records from the database. Only shown when the system
-          detects an internet connection (is_online = True).
-
-What gets shown here
-  1. Risk distribution donut chart
-  2. Vital trends line chart (BP, HR over saved patients)
-  3. Symptom frequency bar chart
-  4. Age vs cholesterol scatter plot
-  5. Diagnosis breakdown horizontal bar chart
-
-Dependencies used here
-  • streamlit — layout and rendering
-  • plotly    — all interactive charts
-  • pandas    — data manipulation for charts
-  • Data comes from database/local_db.py (passed in as DataFrame)
-─────────────────────────────────────────────────────────────────
-"""
+# =============================================================================
+# ui/dashboard.py
+# AuraEcho+ — Patient Dashboard Component
+#
+# Responsibility:
+#     Render interactive visualizations of patient vitals, risk assessment,
+#     and clinical indicators using Plotly. Provides at-a-glance clinical
+#     overview with threshold-aware color coding.
+#
+# Sections:
+#     1. Patient Header Card
+#     2. Risk Gauge
+#     3. Vitals Gauges Grid
+#     4. Feature Radar Chart
+#     5. Categorical Summary
+#
+# Public API:
+#     render_dashboard(patient_data, risk_result) → None
+# =============================================================================
 
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
-import pandas as pd
+from plotly.subplots import make_subplots
+from typing import Any, Dict, List, Optional, Tuple
 
-
-# ── Chart colour palette (matches the blue/white healthcare theme) ───────────
-
-PALETTE = {
-    "blue"       : "#3B5BDB",
-    "light_blue" : "#93C5FD",
-    "green"      : "#22C55E",
-    "amber"      : "#F59E0B",
-    "red"        : "#F43F5E",
-    "purple"     : "#8B5CF6",
-    "teal"       : "#14B8A6",
-    "gray"       : "#9CA3AF",
-}
-
-RISK_COLORS = {
-    "Low"    : PALETTE["green"],
-    "Medium" : PALETTE["amber"],
-    "High"   : PALETTE["red"],
-}
-
-PLOTLY_LAYOUT = dict(
-    font_family = "DM Sans, sans-serif",
-    font_color  = "#1F2937",
-    paper_bgcolor = "rgba(0,0,0,0)",   # transparent background
-    plot_bgcolor  = "rgba(0,0,0,0)",
-    margin = dict(l=16, r=16, t=40, b=16),
-    legend = dict(
-        bgcolor     = "rgba(255,255,255,0.8)",
-        bordercolor = "#E0E7FF",
-        borderwidth = 1,
-        font_size   = 12,
-    ),
+from utils.constants import (
+    APP_NAME,
+    FEATURE_COLUMNS,
+    FEATURE_LABELS,
+    FEATURE_RANGES,
+    NUMERICAL_FEATURES,
+    CATEGORICAL_FEATURES,
+    RISK_LEVELS,
+    RISK_LABELS,
+    RISK_COLORS,
+    RISK_ICONS,
+    UI_PRIMARY_COLOR,
+    UI_SUCCESS_COLOR,
+    UI_WARNING_COLOR,
+    UI_DANGER_COLOR,
+    UI_CARD_COLOR,
+    CHART_THEME,
+    CHART_FONT_FAMILY,
+    CHEST_PAIN_LABELS,
+    THAL_LABELS,
+    SLOPE_LABELS,
+    RESTECG_LABELS,
 )
+from utils.helpers import get_logger, format_score, patient_to_display
+
+logger = get_logger(__name__)
+
+
+# ─────────────────────────────────────────────
+# CSS Styles
+# ─────────────────────────────────────────────
 
 DASHBOARD_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700&display=swap');
-
-.dashboard-header {
-    background: linear-gradient(135deg, #0F172A 0%, #1E3A8A 100%);
-    border-radius: 16px;
-    padding: 24px 30px;
-    color: white;
-    margin-bottom: 24px;
-}
-.dashboard-header h2 {
-    font-size: 22px !important;
-    font-weight: 700 !important;
-    margin: 0 0 6px 0 !important;
-    color: white !important;
-}
-.dashboard-header p { margin:0; font-size:13px; opacity:0.75; }
-
-.chart-card {
-    background: white;
-    border: 1.5px solid #E0E7FF;
-    border-radius: 14px;
-    padding: 20px;
-    margin-bottom: 20px;
-    box-shadow: 0 2px 10px rgba(59,91,219,0.05);
-}
-.chart-title {
-    font-size: 13px; font-weight: 700;
-    color: #1E3A8A; letter-spacing: 0.05em;
-    text-transform: uppercase; margin-bottom: 14px;
-}
-.stat-card {
-    background: white;
-    border: 1.5px solid #E0E7FF;
-    border-radius: 12px;
-    padding: 18px 20px;
-    text-align: center;
-}
-.stat-value {
-    font-size: 32px; font-weight: 800;
-    color: #1E3A8A; line-height: 1;
-}
-.stat-label {
-    font-size: 11px; font-weight: 600;
-    color: #6B7AB8; text-transform: uppercase;
-    letter-spacing: 0.08em; margin-top: 6px;
-}
-.stat-delta {
-    font-size: 12px; font-weight: 600;
-    margin-top: 4px;
-}
-.stat-delta.up   { color: #22C55E; }
-.stat-delta.down { color: #F43F5E; }
-
-.no-data-box {
-    text-align: center; padding: 60px 20px;
-    color: #9CA3AF; background: #F8FAFF;
-    border-radius: 14px; border: 1.5px dashed #C7D2FE;
-}
+    /* Dashboard card */
+    .dash-card {
+        background-color: #ffffff;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        border: 1px solid #e8f0fe;
+        height: 100%;
+    }
+    
+    /* Patient header */
+    .patient-header {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        margin-bottom: 1rem;
+    }
+    .patient-name {
+        font-size: 1.5rem;
+        font-weight: 600;
+        color: #1a1a2e;
+    }
+    .patient-meta {
+        font-size: 0.9rem;
+        color: #5f6368;
+    }
+    
+    /* Status badge */
+    .status-badge {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 500;
+    }
+    .status-normal {
+        background-color: #d4edda;
+        color: #155724;
+    }
+    .status-elevated {
+        background-color: #fff3cd;
+        color: #856404;
+    }
+    .status-high {
+        background-color: #f8d7da;
+        color: #721c24;
+    }
+    
+    /* Chart container */
+    .chart-container {
+        margin-bottom: 1rem;
+    }
+    
+    /* Section title */
+    .dash-section-title {
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: #1a1a2e;
+        margin-bottom: 1rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+    }
+    
+    /* Categorical grid */
+    .cat-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        gap: 0.75rem;
+    }
+    .cat-item {
+        background-color: #f8f9fa;
+        padding: 0.75rem;
+        border-radius: 8px;
+        border-left: 3px solid #1a73e8;
+    }
+    .cat-label {
+        font-size: 0.8rem;
+        color: #5f6368;
+        margin-bottom: 0.25rem;
+    }
+    .cat-value {
+        font-size: 0.95rem;
+        font-weight: 500;
+        color: #1a1a2e;
+    }
 </style>
 """
 
 
-# ── Dummy data generator (used when DB has < 10 records for demo) ──────────
+# ─────────────────────────────────────────────
+# Clinical Threshold Helpers
+# ─────────────────────────────────────────────
 
-def _generate_demo_df(n: int = 80) -> pd.DataFrame:
+# Clinical thresholds for status determination
+_CLINICAL_THRESHOLDS: Dict[str, Dict[str, Tuple[float, float]]] = {
+    "trestbps": {
+        "normal": (0, 120),
+        "elevated": (120, 130),
+        "high": (130, 300),
+    },
+    "chol": {
+        "normal": (0, 200),
+        "elevated": (200, 240),
+        "high": (240, 700),
+    },
+    "thalach": {
+        "low": (0, 100),
+        "normal": (100, 180),
+        "high": (180, 300),
+    },
+    "oldpeak": {
+        "normal": (0, 1.0),
+        "elevated": (1.0, 2.0),
+        "high": (2.0, 10.0),
+    },
+}
+
+
+def _get_vital_status(feature: str, value: float) -> Tuple[str, str]:
     """
-    Creates a realistic synthetic DataFrame for chart demo purposes.
-    In production this is replaced by real records from local_db.py.
+    Determine vital status and color based on clinical thresholds.
+
+    Returns
+    -------
+    (status_label, color)
+        status_label: "Normal" | "Elevated" | "High" | "Low"
+        color: hex color code
     """
-    import numpy as np
-    rng = np.random.default_rng(42)
+    if feature not in _CLINICAL_THRESHOLDS:
+        return "Normal", UI_SUCCESS_COLOR
 
-    ages         = rng.integers(28, 82, n)
-    bp_sys       = rng.integers(100, 190, n)
-    heart_rate   = rng.integers(55, 130, n)
-    cholesterol  = rng.integers(150, 320, n)
-    glucose      = rng.integers(80, 250, n)
+    thresholds = _CLINICAL_THRESHOLDS[feature]
 
-    risks = rng.choice(["Low", "Medium", "High"],
-                       size=n, p=[0.35, 0.40, 0.25])
+    for status, (lo, hi) in thresholds.items():
+        if lo <= value < hi:
+            if status == "normal":
+                return "Normal", UI_SUCCESS_COLOR
+            elif status == "elevated":
+                return "Elevated", UI_WARNING_COLOR
+            elif status in ("high", "low"):
+                return status.capitalize(), UI_DANGER_COLOR
 
-    diagnoses = rng.choice([
-        "Coronary Artery Disease",
-        "Hypertensive Heart Disease",
-        "Arrhythmia",
-        "Heart Failure",
-        "Stable Angina",
-        "Myocardial Infarction",
-    ], size=n)
+    return "Unknown", "#95a5a6"
 
-    symptoms_pool = [
-        "Chest pain", "Shortness of breath",
-        "Palpitations", "Fatigue",
-        "Dizziness", "Swelling",
+
+# ─────────────────────────────────────────────
+# Chart Builders
+# ─────────────────────────────────────────────
+
+def _create_risk_gauge(risk_result: Dict[str, Any]) -> go.Figure:
+    """Create risk score gauge chart."""
+    score = risk_result.get("disease_prob", 0)
+    risk_level = risk_result.get("risk_level", "MEDIUM")
+    risk_label = risk_result.get("risk_label", RISK_LABELS.get(risk_level, risk_level))
+    risk_color = RISK_COLORS.get(risk_level, "#95a5a6")
+    confidence = risk_result.get("confidence_pct", 0)
+
+    # Define gauge steps
+    steps = [
+        {"range": [0, 0.35], "color": RISK_COLORS["LOW"]},
+        {"range": [0.35, 0.65], "color": RISK_COLORS["MEDIUM"]},
+        {"range": [0.65, 1.0], "color": RISK_COLORS["HIGH"]},
     ]
-    symptoms = [
-        ", ".join(rng.choice(symptoms_pool,
-                             size=rng.integers(1, 4), replace=False).tolist())
-        for _ in range(n)
-    ]
 
-    dates = pd.date_range(end=pd.Timestamp.today(), periods=n, freq="3D")
-
-    return pd.DataFrame({
-        "date"        : dates,
-        "age"         : ages,
-        "bp_systolic" : bp_sys,
-        "heart_rate"  : heart_rate,
-        "cholesterol" : cholesterol,
-        "glucose"     : glucose,
-        "risk_level"  : risks,
-        "diagnosis"   : diagnoses,
-        "symptoms"    : symptoms,
-    })
-
-
-# ── Individual chart builders ─────────────────────────────────────────────────
-
-def _chart_risk_donut(df: pd.DataFrame) -> go.Figure:
-    """Risk level distribution donut chart."""
-    counts = df["risk_level"].value_counts().reindex(
-        ["Low", "Medium", "High"], fill_value=0
-    )
-    fig = go.Figure(go.Pie(
-        labels  = counts.index.tolist(),
-        values  = counts.values.tolist(),
-        hole    = 0.60,
-        marker  = dict(
-            colors = [RISK_COLORS[r] for r in counts.index],
-            line   = dict(color="white", width=2),
-        ),
-        textinfo     = "label+percent",
-        textfont     = dict(size=12),
-        hovertemplate= "<b>%{label}</b><br>Patients: %{value}<br>Share: %{percent}<extra></extra>",
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number+delta",
+        value=score * 100,
+        domain={"x": [0, 1], "y": [0, 1]},
+        title={"text": "Cardiac Risk Score", "font": {"size": 16}},
+        delta={"reference": 50, "suffix": "%"},
+        gauge={
+            "axis": {"range": [0, 100], "tickwidth": 1},
+            "bar": {"color": risk_color},
+            "bgcolor": "white",
+            "borderwidth": 2,
+            "bordercolor": "#e0e0e0",
+            "steps": steps,
+            "threshold": {
+                "line": {"color": "red", "width": 4},
+                "thickness": 0.75,
+                "value": 90,
+            },
+        },
+        number={"suffix": "%", "font": {"size": 28}},
     ))
+
     fig.update_layout(
-        **PLOTLY_LAYOUT,
-        showlegend  = False,
-        height      = 280,
-        annotations = [dict(
-            text      = f"<b>{len(df)}</b><br><span style='font-size:11px'>patients</span>",
-            x=0.5, y=0.5, font_size=18, showarrow=False,
-            font_color="#1E3A8A",
-        )],
+        height=250,
+        margin=dict(l=20, r=20, t=40, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        font={"family": CHART_FONT_FAMILY},
+        annotations=[
+            dict(
+                text=f"{risk_label}<br>Confidence: {confidence:.0f}%",
+                x=0.5,
+                y=-0.1,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font={"size": 12, "color": "#555"},
+            )
+        ],
     )
+
     return fig
 
 
-def _chart_vitals_trend(df: pd.DataFrame) -> go.Figure:
-    """BP systolic and heart rate over time."""
-    df_sorted = df.sort_values("date")
-    # Rolling average for smoother lines
-    df_sorted["bp_ma"]  = df_sorted["bp_systolic"].rolling(5, min_periods=1).mean()
-    df_sorted["hr_ma"]  = df_sorted["heart_rate"].rolling(5, min_periods=1).mean()
+def _create_vital_gauge(
+    value: float,
+    feature: str,
+    label: str,
+) -> go.Figure:
+    """Create a single vital sign gauge."""
+    status, color = _get_vital_status(feature, value)
+    min_val, max_val = FEATURE_RANGES.get(feature, (0, 100))
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df_sorted["date"], y=df_sorted["bp_ma"],
-        name="Systolic BP", mode="lines",
-        line=dict(color=PALETTE["blue"], width=2.5),
-        hovertemplate="BP: %{y:.0f} mmHg<extra></extra>",
+    # Determine unit
+    units = {
+        "trestbps": "mm Hg",
+        "chol": "mg/dl",
+        "thalach": "bpm",
+        "oldpeak": "",
+        "age": "yr",
+    }
+    unit = units.get(feature, "")
+
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        domain={"x": [0, 1], "y": [0, 1]},
+        title={"text": label, "font": {"size": 12}},
+        gauge={
+            "axis": {"range": [min_val, max_val], "tickwidth": 1},
+            "bar": {"color": color},
+            "bgcolor": "white",
+            "borderwidth": 1,
+            "bordercolor": "#e0e0e0",
+            "steps": [
+                {"range": [min_val, max_val], "color": "#f0f0f0"},
+            ],
+        },
+        number={"suffix": f" {unit}", "font": {"size": 20}},
     ))
-    fig.add_trace(go.Scatter(
-        x=df_sorted["date"], y=df_sorted["hr_ma"],
-        name="Heart Rate", mode="lines",
-        line=dict(color=PALETTE["red"], width=2.5, dash="dash"),
-        hovertemplate="HR: %{y:.0f} bpm<extra></extra>",
-    ))
-    # Reference lines
-    fig.add_hline(y=140, line_dash="dot",
-                  line_color=PALETTE["amber"], opacity=0.5,
-                  annotation_text="BP alert (140)", annotation_font_size=10)
+
     fig.update_layout(
-        **PLOTLY_LAYOUT,
-        height=280,
-        xaxis=dict(showgrid=False, title=""),
-        yaxis=dict(showgrid=True, gridcolor="#F3F4F6",
-                   title="Value", title_font_size=11),
+        height=180,
+        margin=dict(l=10, r=10, t=30, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        font={"family": CHART_FONT_FAMILY},
+        annotations=[
+            dict(
+                text=status,
+                x=0.5,
+                y=-0.1,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font={"size": 10, "color": color, "weight": "bold"},
+            )
+        ],
     )
+
     return fig
 
 
-def _chart_symptom_frequency(df: pd.DataFrame) -> go.Figure:
-    """Horizontal bar chart of most common symptoms."""
-    from collections import Counter
-    all_symptoms = []
-    for row in df["symptoms"].dropna():
-        all_symptoms.extend([s.strip() for s in str(row).split(",")])
-
-    counts = Counter(all_symptoms).most_common(8)
-    if not counts:
+def _create_feature_radar(risk_result: Dict[str, Any]) -> go.Figure:
+    """Create radar chart for top contributing features."""
+    contributions = risk_result.get("feature_contributions", [])
+    if not contributions:
         return None
 
-    labels = [c[0] for c in reversed(counts)]
-    values = [c[1] for c in reversed(counts)]
+    # Top 6 features
+    top_features = contributions[:6]
+    features = [c["feature"] for c in top_features]
+    importances = [c["importance"] for c in top_features]
 
-    fig = go.Figure(go.Bar(
-        x           = values,
-        y           = labels,
-        orientation = "h",
-        marker      = dict(
-            color     = values,
-            colorscale= [[0, PALETTE["light_blue"]], [1, PALETTE["blue"]]],
-            showscale = False,
-            line      = dict(color="white", width=0.5),
-        ),
-        hovertemplate = "<b>%{y}</b><br>Patients: %{x}<extra></extra>",
-    ))
-    fig.update_layout(
-        **PLOTLY_LAYOUT,
-        height=300,
-        xaxis=dict(showgrid=True, gridcolor="#F3F4F6", title="Patient count"),
-        yaxis=dict(showgrid=False, automargin=True),
-    )
-    return fig
+    # Normalize to 0-100 for radar
+    max_imp = max(importances) if importances else 1
+    values = [(v / max_imp) * 100 for v in importances]
 
-
-def _chart_age_cholesterol(df: pd.DataFrame) -> go.Figure:
-    """Scatter: age vs cholesterol, coloured by risk level."""
     fig = go.Figure()
-    for risk, color in RISK_COLORS.items():
-        subset = df[df["risk_level"] == risk]
-        fig.add_trace(go.Scatter(
-            x    = subset["age"],
-            y    = subset["cholesterol"],
-            mode = "markers",
-            name = f"{risk} Risk",
-            marker= dict(
-                color   = color,
-                size    = 9,
-                opacity = 0.75,
-                line    = dict(color="white", width=1),
-            ),
-            hovertemplate=(
-                f"<b>{risk} Risk</b><br>"
-                "Age: %{x}<br>Cholesterol: %{y} mg/dL<extra></extra>"
-            ),
-        ))
-    # Threshold lines
-    fig.add_vline(x=50, line_dash="dot", line_color=PALETTE["gray"],
-                  opacity=0.5, annotation_text="Age 50", annotation_font_size=10)
-    fig.add_hline(y=240, line_dash="dot", line_color=PALETTE["amber"],
-                  opacity=0.5, annotation_text="High chol.", annotation_font_size=10)
-    fig.update_layout(
-        **PLOTLY_LAYOUT,
-        height=300,
-        xaxis=dict(showgrid=True, gridcolor="#F3F4F6", title="Age (years)"),
-        yaxis=dict(showgrid=True, gridcolor="#F3F4F6", title="Cholesterol (mg/dL)"),
-    )
-    return fig
-
-
-def _chart_diagnosis_breakdown(df: pd.DataFrame) -> go.Figure:
-    """Horizontal bar — how many patients per diagnosis."""
-    counts = df["diagnosis"].value_counts().head(7)
-    colors = [PALETTE["blue"], PALETTE["teal"], PALETTE["purple"],
-              PALETTE["amber"], PALETTE["red"], PALETTE["green"],
-              PALETTE["light_blue"]]
-
-    fig = go.Figure(go.Bar(
-        x           = counts.values,
-        y           = counts.index,
-        orientation = "h",
-        marker_color= colors[:len(counts)],
-        hovertemplate = "<b>%{y}</b><br>Count: %{x}<extra></extra>",
+    fig.add_trace(go.Scatterpolar(
+        r=values,
+        theta=features,
+        fill="toself",
+        fillcolor=UI_PRIMARY_COLOR + "40",
+        line={"color": UI_PRIMARY_COLOR, "width": 2},
+        name="Feature Importance",
     ))
+
     fig.update_layout(
-        **PLOTLY_LAYOUT,
+        polar=dict(
+            radialaxis=dict(
+                visible=True,
+                range=[0, 100],
+                tickmode="array",
+                tickvals=[0, 25, 50, 75, 100],
+                ticktext=["0", "25", "50", "75", "100"],
+            ),
+            angularaxis=dict(
+                tickfont={"size": 10},
+            ),
+        ),
+        showlegend=False,
         height=300,
-        xaxis=dict(showgrid=True, gridcolor="#F3F4F6", title="Patient count"),
-        yaxis=dict(showgrid=False, automargin=True),
+        margin=dict(l=40, r=40, t=20, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        font={"family": CHART_FONT_FAMILY},
     )
+
     return fig
 
 
-# ── Summary stats row ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Render Functions
+# ─────────────────────────────────────────────
 
-def _render_stat_cards(df: pd.DataFrame):
-    """4 KPI cards above the charts."""
-    total     = len(df)
-    high_risk = int((df["risk_level"] == "High").sum())
-    avg_bp    = int(df["bp_systolic"].mean())
-    avg_age   = int(df["age"].mean())
+def _render_patient_header(patient_data: Dict[str, Any]) -> None:
+    """Render patient header card."""
+    name = patient_data.get("name", "Unknown Patient")
+    age = patient_data.get("age", "?")
+    sex = patient_data.get("sex", 1)
+    sex_label = "Male" if sex == 1 else "Female"
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-value">{total}</div>
-            <div class="stat-label">Total Patients</div>
-        </div>""", unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-value" style="color:#F43F5E">{high_risk}</div>
-            <div class="stat-label">High Risk Cases</div>
-            <div class="stat-delta {'up' if high_risk > total*0.2 else 'down'}">
-                {high_risk/total*100:.0f}% of total
+    st.markdown(
+        f"""
+        <div class="dash-card">
+            <div class="patient-header">
+                <div style="font-size: 2.5rem;">🫀</div>
+                <div>
+                    <div class="patient-name">{name}</div>
+                    <div class="patient-meta">
+                        {age} years · {sex_label}
+                    </div>
+                </div>
             </div>
-        </div>""", unsafe_allow_html=True)
-    with c3:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-value">{avg_bp}</div>
-            <div class="stat-label">Avg Systolic BP</div>
-            <div class="stat-delta {'up' if avg_bp > 130 else 'down'}">
-                {'↑ Above normal' if avg_bp > 130 else '✓ Normal range'}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_risk_section(risk_result: Dict[str, Any]) -> None:
+    """Render risk gauge section."""
+    st.markdown(
+        """
+        <div class="dash-section-title">
+            📊 Cardiac Risk Assessment
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="dash-card">', unsafe_allow_html=True)
+    fig = _create_risk_gauge(risk_result)
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def _render_vitals_section(patient_data: Dict[str, Any]) -> None:
+    """Render vitals gauges grid."""
+    st.markdown(
+        """
+        <div class="dash-section-title">
+            💓 Vital Signs
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Numerical features to display
+    display_features = ["age", "trestbps", "chol", "thalach", "oldpeak"]
+
+    cols = st.columns(len(display_features))
+    for i, feature in enumerate(display_features):
+        with cols[i]:
+            value = patient_data.get(feature, 0)
+            label = FEATURE_LABELS.get(feature, feature)
+            # Clean label for gauge
+            label_short = label.split("(")[0].strip()
+
+            fig = _create_vital_gauge(value, feature, label_short)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+def _render_radar_section(risk_result: Dict[str, Any]) -> None:
+    """Render feature importance radar chart."""
+    st.markdown(
+        """
+        <div class="dash-section-title">
+            🎯 Key Risk Contributors
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="dash-card">', unsafe_allow_html=True)
+    fig = _create_feature_radar(risk_result)
+    if fig:
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    else:
+        st.info("Feature contributions not available.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def _render_categorical_section(patient_data: Dict[str, Any]) -> None:
+    """Render categorical features summary."""
+    st.markdown(
+        """
+        <div class="dash-section-title">
+            📋 Clinical Findings
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="dash-card">', unsafe_allow_html=True)
+
+    # Decode maps
+    decode_maps = {
+        "cp": CHEST_PAIN_LABELS,
+        "restecg": RESTECG_LABELS,
+        "slope": SLOPE_LABELS,
+        "thal": THAL_LABELS,
+        "fbs": {0: "Normal", 1: "Elevated"},
+        "exang": {0: "Absent", 1: "Present"},
+    }
+
+    st.markdown('<div class="cat-grid">', unsafe_allow_html=True)
+
+    for feature in ["cp", "restecg", "slope", "thal", "fbs", "exang"]:
+        value = patient_data.get(feature, 0)
+        label = FEATURE_LABELS.get(feature, feature)
+        decode = decode_maps.get(feature, {})
+        display_value = decode.get(int(value), str(value))
+
+        st.markdown(
+            f"""
+            <div class="cat-item">
+                <div class="cat-label">{label}</div>
+                <div class="cat-value">{display_value}</div>
             </div>
-        </div>""", unsafe_allow_html=True)
-    with c4:
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-value">{avg_age}</div>
-            <div class="stat-label">Average Age</div>
-        </div>""", unsafe_allow_html=True)
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # CA (major vessels)
+    ca = patient_data.get("ca", 0)
+    st.markdown(
+        f"""
+        <div class="cat-item">
+            <div class="cat-label">{FEATURE_LABELS.get("ca", "Major Vessels")}</div>
+            <div class="cat-value">{ca} vessel(s)</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
-# ── Main render function ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Main Render Function
+# ─────────────────────────────────────────────
 
-def render_dashboard(records_df: pd.DataFrame = None):
+def render_dashboard(
+    patient_data: Dict[str, Any],
+    risk_result: Optional[Dict[str, Any]] = None,
+) -> None:
     """
-    Main entry point for the analytics dashboard tab.
-    Called from app.py only when is_online is True.
+    Render the complete patient dashboard.
 
     Parameters
     ----------
-    records_df : pd.DataFrame | None
-        Patient records from database/local_db.py.
-        If None or too few rows, demo data is used automatically.
+    patient_data : dict — patient input data
+    risk_result  : dict — RiskResult.to_dict() or None
     """
+    # Inject CSS
     st.markdown(DASHBOARD_CSS, unsafe_allow_html=True)
 
-    # Use real data if available, else demo
-    if records_df is None or len(records_df) < 5:
-        df = _generate_demo_df(80)
-        st.info(
-            "📊 Showing **demo analytics** — based on synthetic data. "
-            "Real patient records will appear here as doctors use the system.",
-            icon="ℹ️"
-        )
+    # Check for patient data
+    if not patient_data:
+        st.info("👈 Enter patient data in the sidebar to view the dashboard.")
+        return
+
+    # Patient header
+    _render_patient_header(patient_data)
+
+    # Layout based on risk result availability
+    if risk_result:
+        # Two-column layout with risk and radar
+        col_risk, col_radar = st.columns([1, 1])
+
+        with col_risk:
+            _render_risk_section(risk_result)
+
+        with col_radar:
+            _render_radar_section(risk_result)
+
+        # Vitals section
+        _render_vitals_section(patient_data)
+
+        # Categorical section
+        _render_categorical_section(patient_data)
+
     else:
-        df = records_df
+        # No risk result — show vitals and categorical only
+        _render_vitals_section(patient_data)
+        _render_categorical_section(patient_data)
 
-    # Header banner
-    st.markdown(f"""
-    <div class="dashboard-header">
-        <h2>📈 Cardiac Analytics Dashboard</h2>
-        <p>Real-time insights from {len(df)} patient records · Online mode active</p>
-    </div>
-    """, unsafe_allow_html=True)
+        st.info(
+            "💡 Click **Analyze Patient** in the sidebar to generate risk assessment."
+        )
 
-    # KPI stat cards
-    _render_stat_cards(df)
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Row 1: Donut + Vitals trend ─────────────────────────────────────────
-    col1, col2 = st.columns([1, 1.6])
-
-    with col1:
-        st.markdown('<div class="chart-card">'
-                    '<div class="chart-title">🎯 Risk Distribution</div>',
-                    unsafe_allow_html=True)
-        st.plotly_chart(_chart_risk_donut(df),
-                        use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col2:
-        st.markdown('<div class="chart-card">'
-                    '<div class="chart-title">📈 Vitals Trend Over Time</div>',
-                    unsafe_allow_html=True)
-        st.plotly_chart(_chart_vitals_trend(df),
-                        use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # ── Row 2: Symptom freq + Age vs Cholesterol ────────────────────────────
-    col3, col4 = st.columns(2)
-
-    with col3:
-        st.markdown('<div class="chart-card">'
-                    '<div class="chart-title">🩺 Symptom Frequency</div>',
-                    unsafe_allow_html=True)
-        fig_sym = _chart_symptom_frequency(df)
-        if fig_sym:
-            st.plotly_chart(fig_sym, use_container_width=True,
-                            config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col4:
-        st.markdown('<div class="chart-card">'
-                    '<div class="chart-title">🔬 Age vs Cholesterol by Risk</div>',
-                    unsafe_allow_html=True)
-        st.plotly_chart(_chart_age_cholesterol(df),
-                        use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # ── Row 3: Diagnosis breakdown (full width) ─────────────────────────────
-    st.markdown('<div class="chart-card">'
-                '<div class="chart-title">🏥 Diagnosis Breakdown</div>',
-                unsafe_allow_html=True)
-    st.plotly_chart(_chart_diagnosis_breakdown(df),
-                    use_container_width=True, config={"displayModeBar": False})
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # ── Footer note ─────────────────────────────────────────────────────────
-    st.markdown("""
-    <div style="text-align:center; font-size:11px; color:#9CA3AF; padding:16px 0;">
-        AuraCure Analytics · Data shown is for clinical decision support purposes only.<br>
-        All patient data is stored locally and synced securely when online.
-    </div>
-    """, unsafe_allow_html=True) 
+    # Debug expander
+    with st.expander("🔧 Dashboard Debug", expanded=False):
+        st.json({
+            "patient_data": patient_data,
+            "risk_result": risk_result,
+        })

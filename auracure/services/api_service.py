@@ -1,739 +1,602 @@
-"""
-services/api_service.py
-───────────────────────
-Clinical reference API layer for AuraEcho+.
+# =============================================================================
+# services/api_service.py
+# AuraEcho+ — Cardiology Guidelines & Mock API Service
+#
+# Responsibility:
+#     Provide structured cardiology guidelines, treatment protocols, and
+#     reference data. Acts as a mock API for clinical decision support.
+#     All data is local — no external network calls.
+#
+# Public API:
+#     get_guidelines(risk_level)           → dict
+#     get_treatment_recommendations(...)   → dict
+#     get_reference_data()                 → dict
+#     get_risk_factor_info(factor)         → dict
+#     get_emergency_protocols()            → dict
+#     mock_api_call(endpoint, params)      → dict
+# =============================================================================
 
-Responsibility:
-    Provide structured access to cardiology clinical guidelines,
-    drug interaction checking, ICD-10 code lookup, and lab reference
-    ranges. Acts as a mock/local implementation of what would be a
-    real clinical API (like ClinicalTrials.gov or a hospital formulary).
+from typing import Any, Dict, List, Optional
 
-Why a mock layer?
-    In a hackathon/MVP context, we cannot integrate live hospital
-    APIs (HL7 FHIR, Epic, Cerner). This module provides:
-        1. Realistic clinical content (ACC/AHA guideline summaries)
-        2. The same interface a real API would expose
-        3. Easy future swap — replace mock data with real HTTP calls
-           without changing any calling code
-
-What's in here:
-    • get_guidelines(risk_level)      — ACC/AHA treatment guidelines
-    • get_drug_interactions(drugs)    — common cardiac drug interactions
-    • get_icd10_codes(risk_level)     — relevant ICD-10 billing codes
-    • get_lab_reference_ranges()      — normal ranges for cardiac labs
-    • get_lifestyle_recommendations() — evidence-based lifestyle advice
-    • get_emergency_criteria()        — when to call 911 / emergency referral
-
-Public API:
-    get_guidelines(risk_level)              → GuidelineResult
-    check_drug_interactions(drug_list)      → List[InteractionAlert]
-    get_icd10(risk_level, symptoms)         → List[ICD10Code]
-    get_lab_ranges()                        → Dict[str, LabRange]
-    get_lifestyle_advice(risk_level)        → List[str]
-    get_emergency_criteria()                → List[str]
-    get_full_clinical_brief(patient, risk)  → ClinicalBrief
-"""
-
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
-
-from utils.constants import RISK_LOW, RISK_MEDIUM, RISK_HIGH
+from utils.constants import (
+    RISK_LEVELS,
+    RISK_LABELS,
+    FEATURE_LABELS,
+    CHEST_PAIN_LABELS,
+    THAL_LABELS,
+    RESTECG_LABELS,
+)
 from utils.helpers import get_logger
 
 logger = get_logger(__name__)
 
 
 # ─────────────────────────────────────────────
-# Data classes
+# Clinical Guidelines Database
+# Based on ACC/AHA guidelines (simplified for demonstration)
 # ─────────────────────────────────────────────
 
-@dataclass
-class GuidelineResult:
-    """
-    Structured ACC/AHA guideline output for a given risk level.
-
-    Attributes
-    ----------
-    risk_level        : str
-    guideline_class   : str  "Class I" | "Class IIa" | "Class IIb" | "Class III"
-    evidence_level    : str  "Level A" | "Level B" | "Level C"
-    recommendations   : List[str]  — ordered list of clinical actions
-    medications       : List[str]  — first-line medications
-    monitoring        : List[str]  — what to track and how often
-    referral          : str        — when/who to refer to
-    source            : str        — guideline document name + year
-    """
-    risk_level:      str
-    guideline_class: str
-    evidence_level:  str
-    recommendations: List[str]    = field(default_factory=list)
-    medications:     List[str]    = field(default_factory=list)
-    monitoring:      List[str]    = field(default_factory=list)
-    referral:        str          = ""
-    source:          str          = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "risk_level":      self.risk_level,
-            "guideline_class": self.guideline_class,
-            "evidence_level":  self.evidence_level,
-            "recommendations": self.recommendations,
-            "medications":     self.medications,
-            "monitoring":      self.monitoring,
-            "referral":        self.referral,
-            "source":          self.source,
-        }
-
-
-@dataclass
-class InteractionAlert:
-    """
-    A drug-drug interaction warning.
-
-    Attributes
-    ----------
-    drug_a      : str
-    drug_b      : str
-    severity    : str  "Major" | "Moderate" | "Minor"
-    description : str  — what the interaction causes
-    action      : str  — what the clinician should do
-    """
-    drug_a:      str
-    drug_b:      str
-    severity:    str
-    description: str
-    action:      str
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "drug_a":      self.drug_a,
-            "drug_b":      self.drug_b,
-            "severity":    self.severity,
-            "description": self.description,
-            "action":      self.action,
-        }
-
-
-@dataclass
-class ICD10Code:
-    """An ICD-10-CM diagnostic code."""
-    code:        str
-    description: str
-    category:    str
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {"code": self.code, "description": self.description, "category": self.category}
-
-
-@dataclass
-class LabRange:
-    """Normal reference range for a lab value."""
-    name:    str
-    low:     float
-    high:    float
-    unit:    str
-    notes:   str = ""
-
-    def is_normal(self, value: float) -> bool:
-        return self.low <= value <= self.high
-
-    def flag(self, value: float) -> str:
-        if value < self.low:   return "LOW ↓"
-        if value > self.high:  return "HIGH ↑"
-        return "Normal"
-
-
-@dataclass
-class ClinicalBrief:
-    """
-    Complete clinical reference package for one patient.
-    Combines guidelines + drugs + ICD-10 + labs + lifestyle.
-    """
-    risk_level:     str
-    guidelines:     GuidelineResult
-    interactions:   List[InteractionAlert]  = field(default_factory=list)
-    icd10_codes:    List[ICD10Code]         = field(default_factory=list)
-    lab_flags:      Dict[str, str]          = field(default_factory=dict)
-    lifestyle:      List[str]               = field(default_factory=list)
-    emergency_flags: List[str]              = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "risk_level":      self.risk_level,
-            "guidelines":      self.guidelines.to_dict(),
-            "interactions":    [i.to_dict() for i in self.interactions],
-            "icd10_codes":     [c.to_dict() for c in self.icd10_codes],
-            "lab_flags":       self.lab_flags,
-            "lifestyle":       self.lifestyle,
-            "emergency_flags": self.emergency_flags,
-        }
-
-
-# ─────────────────────────────────────────────
-# Static clinical data (mock / embedded)
-# ─────────────────────────────────────────────
-
-# ACC/AHA Heart Failure and Coronary Artery Disease Guidelines 2023
 _GUIDELINES: Dict[str, Dict[str, Any]] = {
-    RISK_LOW: {
-        "guideline_class": "Class I",
-        "evidence_level":  "Level B",
-        "source":          "ACC/AHA Guideline on Primary Prevention of CVD (2023)",
+    "LOW": {
+        "summary": "Low cardiac risk. Focus on prevention and routine monitoring.",
+        "acc_aha_class": "Class I",
         "recommendations": [
-            "Lifestyle modification as first-line intervention",
-            "Annual cardiovascular risk assessment",
-            "Blood pressure monitoring every 6 months",
-            "Fasting lipid panel annually",
-            "Diabetes screening every 3 years if risk factors present",
-            "Encourage physical activity: ≥150 min/week moderate intensity",
-            "Dietary counselling: Mediterranean or DASH diet",
-            "Smoking cessation counselling if applicable",
+            "Continue routine cardiovascular risk assessment every 3-5 years",
+            "Encourage heart-healthy lifestyle (diet, exercise, smoking cessation)",
+            "Monitor blood pressure and cholesterol annually",
+            "No immediate cardiac testing indicated",
         ],
-        "medications": [
-            "Aspirin 81mg/day — only if 10-year ASCVD risk ≥10% after shared decision-making",
-            "Statin therapy if LDL-C ≥190 mg/dL or 10-year risk ≥7.5%",
-            "ACE inhibitor — consider if hypertension present",
+        "follow_up": "Primary care follow-up in 6-12 months",
+        "red_flags": [
+            "New onset chest pain",
+            "Unexplained shortness of breath",
+            "Syncope or near-syncope",
         ],
-        "monitoring": [
-            "Blood pressure: every 6 months",
-            "Lipid panel: annually",
-            "HbA1c: annually if pre-diabetic",
-            "Weight/BMI: every visit",
-            "12-lead ECG: baseline, then as clinically indicated",
-        ],
-        "referral": "Primary care follow-up in 3-6 months. Cardiology only if symptoms develop.",
     },
-    RISK_MEDIUM: {
-        "guideline_class": "Class IIa",
-        "evidence_level":  "Level B",
-        "source":          "ACC/AHA CAD Management Guideline (2023)",
+    "MEDIUM": {
+        "summary": "Moderate cardiac risk. Further evaluation recommended.",
+        "acc_aha_class": "Class IIa",
         "recommendations": [
-            "Initiate or intensify statin therapy (moderate-to-high intensity)",
-            "Blood pressure control target: <130/80 mmHg",
-            "Consider stress testing (exercise treadmill or pharmacologic)",
-            "Order coronary artery calcium (CAC) score if decision uncertain",
-            "Antiplatelet therapy discussion with physician",
-            "Cardiac rehabilitation referral if CAD confirmed",
-            "Optimise diabetes management if HbA1c >7%",
-            "Sleep apnoea screening (OSA worsens cardiac outcomes)",
+            "Consider stress testing or coronary calcium scoring",
+            "Optimize blood pressure control (target <130/80 mmHg)",
+            "Evaluate for diabetes and metabolic syndrome",
+            "Consider statin therapy based on ASCVD risk calculator",
+            "Lifestyle modification counseling",
         ],
-        "medications": [
-            "High-intensity statin: Atorvastatin 40-80mg or Rosuvastatin 20-40mg",
-            "ACE inhibitor or ARB: if hypertension or reduced EF",
-            "Beta-blocker: if prior MI, HF, or angina symptoms",
-            "Aspirin 81mg/day: if established ASCVD",
-            "Consider SGLT-2 inhibitor if T2DM co-existing",
+        "follow_up": "Cardiology consultation within 2-4 weeks",
+        "red_flags": [
+            "Chest pain with exertion",
+            "Worsening exercise tolerance",
+            "New ECG abnormalities",
         ],
-        "monitoring": [
-            "Blood pressure: every 1-3 months until controlled",
-            "Lipid panel: 4-6 weeks after statin initiation, then annually",
-            "HbA1c: every 3-6 months if diabetic",
-            "Renal function + electrolytes: annually (ACE/ARB use)",
-            "12-lead ECG: every 6-12 months",
-            "Echocardiogram: baseline EF assessment",
-        ],
-        "referral": "Cardiology within 2-4 weeks. Consider stress echo or nuclear perfusion study.",
     },
-    RISK_HIGH: {
-        "guideline_class": "Class I",
-        "evidence_level":  "Level A",
-        "source":          "ACC/AHA ACS Management Guideline (2023) + ESC Guidelines",
+    "HIGH": {
+        "summary": "High cardiac risk. Urgent evaluation required.",
+        "acc_aha_class": "Class I",
         "recommendations": [
-            "🚨 URGENT: Immediate cardiology evaluation",
-            "Rule out acute coronary syndrome (ACS) — obtain serial troponins",
-            "12-lead ECG immediately and at 3-6 hours",
-            "Admit for monitoring if ACS cannot be excluded",
-            "Dual antiplatelet therapy (DAPT) if ACS confirmed",
-            "Coronary angiography — consider within 24-72 hours",
-            "Echocardiogram to assess LV function",
-            "High-intensity statin therapy regardless of baseline LDL",
-            "IV anticoagulation if STEMI or high-risk NSTEMI",
-            "Revascularisation (PCI or CABG) based on anatomy",
+            "Urgent cardiology referral",
+            "Consider coronary angiography if symptoms suggest ACS",
+            "Initiate or intensify medical therapy (antiplatelet, statin, beta-blocker)",
+            "Evaluate for revascularization if indicated",
+            "Close monitoring of symptoms and vital signs",
         ],
-        "medications": [
-            "Aspirin 325mg loading dose, then 81mg/day",
-            "P2Y12 inhibitor: Ticagrelor 180mg loading or Clopidogrel 600mg loading",
-            "High-intensity statin: Atorvastatin 80mg STAT",
-            "Beta-blocker: Metoprolol succinate — if haemodynamically stable",
-            "ACE inhibitor: Lisinopril — if EF <40% or anterior MI",
-            "Anticoagulation: Heparin IV or LMWH per ACS protocol",
-            "Nitroglycerin: for ongoing chest pain (avoid if hypotensive)",
-            "Consider ezetimibe + PCSK9 inhibitor if LDL >70 mg/dL on max statin",
+        "follow_up": "Immediate cardiology evaluation (within 24-48 hours)",
+        "red_flags": [
+            "Chest pain at rest or with minimal exertion",
+            "Signs of heart failure",
+            "Hemodynamic instability",
+            "Malignant arrhythmias",
         ],
-        "monitoring": [
-            "Continuous cardiac monitoring (telemetry)",
-            "Troponin every 3-6 hours × 3 sets",
-            "BMP, CBC, coagulation studies STAT",
-            "Blood pressure every 15-30 minutes (acute phase)",
-            "Urine output monitoring",
-            "Serial ECGs every 6-8 hours",
-            "Daily echocardiogram if EF impaired",
+    },
+}
+
+
+# ─────────────────────────────────────────────
+# Treatment Protocols
+# ─────────────────────────────────────────────
+
+_TREATMENT_PROTOCOLS: Dict[str, Dict[str, Any]] = {
+    "lifestyle": {
+        "title": "Lifestyle Modifications",
+        "items": [
+            {
+                "name": "Diet",
+                "description": "Mediterranean or DASH diet; limit saturated fats and sodium",
+                "priority": "high",
+            },
+            {
+                "name": "Exercise",
+                "description": "150 minutes moderate aerobic activity per week",
+                "priority": "high",
+            },
+            {
+                "name": "Smoking Cessation",
+                "description": "Complete tobacco avoidance; offer cessation support",
+                "priority": "critical",
+            },
+            {
+                "name": "Weight Management",
+                "description": "Target BMI 18.5-24.9; waist circumference <40\" (M) / <35\" (F)",
+                "priority": "medium",
+            },
         ],
-        "referral": "🚨 EMERGENCY: Immediate cardiology / interventional cardiology. Consider cath lab activation.",
+    },
+    "medication": {
+        "title": "Pharmacologic Therapy",
+        "items": [
+            {
+                "name": "Antiplatelet",
+                "description": "Aspirin 81mg daily if ASCVD risk >10%",
+                "priority": "medium",
+                "risk_levels": ["MEDIUM", "HIGH"],
+            },
+            {
+                "name": "Statin",
+                "description": "Moderate to high-intensity statin based on risk",
+                "priority": "high",
+                "risk_levels": ["MEDIUM", "HIGH"],
+            },
+            {
+                "name": "ACE Inhibitor/ARB",
+                "description": "If hypertension, diabetes, or CKD present",
+                "priority": "medium",
+                "risk_levels": ["MEDIUM", "HIGH"],
+            },
+            {
+                "name": "Beta-Blocker",
+                "description": "If history of MI, heart failure, or angina",
+                "priority": "high",
+                "risk_levels": ["HIGH"],
+            },
+        ],
+    },
+    "diagnostic": {
+        "title": "Diagnostic Testing",
+        "items": [
+            {
+                "name": "Resting ECG",
+                "description": "Baseline assessment for all patients",
+                "priority": "high",
+                "risk_levels": ["LOW", "MEDIUM", "HIGH"],
+            },
+            {
+                "name": "Stress Test",
+                "description": "Exercise or pharmacologic stress testing",
+                "priority": "medium",
+                "risk_levels": ["MEDIUM", "HIGH"],
+            },
+            {
+                "name": "Echocardiogram",
+                "description": "Assess cardiac structure and function",
+                "priority": "medium",
+                "risk_levels": ["MEDIUM", "HIGH"],
+            },
+            {
+                "name": "Coronary Angiography",
+                "description": "Invasive assessment if high suspicion of CAD",
+                "priority": "high",
+                "risk_levels": ["HIGH"],
+            },
+        ],
     },
 }
 
-# Common cardiac drug-drug interactions
-_DRUG_INTERACTIONS: List[Dict[str, Any]] = [
-    {
-        "drugs":       ("warfarin", "aspirin"),
-        "severity":    "Major",
-        "description": "Increased bleeding risk — additive anticoagulant effect",
-        "action":      "Monitor INR closely; use lowest effective aspirin dose; consider PPI prophylaxis",
-    },
-    {
-        "drugs":       ("simvastatin", "amlodipine"),
-        "severity":    "Moderate",
-        "description": "Amlodipine inhibits CYP3A4, increasing simvastatin exposure — myopathy risk",
-        "action":      "Limit simvastatin to 20mg/day; prefer rosuvastatin or pravastatin",
-    },
-    {
-        "drugs":       ("metoprolol", "verapamil"),
-        "severity":    "Major",
-        "description": "Additive negative chronotropic and dromotropic effects — risk of AV block / bradycardia",
-        "action":      "Avoid combination; if necessary, start at very low doses with continuous monitoring",
-    },
-    {
-        "drugs":       ("lisinopril", "spironolactone"),
-        "severity":    "Major",
-        "description": "Both increase serum potassium — risk of life-threatening hyperkalaemia",
-        "action":      "Monitor electrolytes weekly initially; consider dose reduction; target K+ <5.5",
-    },
-    {
-        "drugs":       ("clopidogrel", "omeprazole"),
-        "severity":    "Moderate",
-        "description": "Omeprazole inhibits CYP2C19, reducing clopidogrel activation by up to 47%",
-        "action":      "Switch to pantoprazole or famotidine for GI protection",
-    },
-    {
-        "drugs":       ("atorvastatin", "clarithromycin"),
-        "severity":    "Major",
-        "description": "CYP3A4 inhibition dramatically increases atorvastatin levels — severe myopathy / rhabdomyolysis",
-        "action":      "Withhold atorvastatin during clarithromycin course; resume after antibiotic completed",
-    },
-    {
-        "drugs":       ("digoxin", "amiodarone"),
-        "severity":    "Major",
-        "description": "Amiodarone inhibits P-gp and CYP3A4, increasing digoxin levels 70-100%",
-        "action":      "Reduce digoxin dose by 50% when starting amiodarone; monitor levels closely",
-    },
-    {
-        "drugs":       ("heparin", "nsaids"),
-        "severity":    "Moderate",
-        "description": "NSAIDs inhibit platelet function and may increase GI bleeding risk with heparin",
-        "action":      "Avoid NSAIDs; use acetaminophen for pain; add PPI if combination unavoidable",
-    },
-]
 
-# ICD-10-CM codes for cardiac diagnoses
-_ICD10_CODES: Dict[str, List[Dict[str, str]]] = {
-    RISK_LOW: [
-        {"code": "Z13.6",   "description": "Encounter for screening for cardiovascular disorders", "category": "Screening"},
-        {"code": "Z82.49",  "description": "Family history of ischaemic heart disease and other diseases", "category": "Family History"},
-        {"code": "I10",     "description": "Essential (primary) hypertension", "category": "Hypertension"},
-    ],
-    RISK_MEDIUM: [
-        {"code": "I25.10",  "description": "Atherosclerotic heart disease of native coronary artery", "category": "CAD"},
-        {"code": "I25.2",   "description": "Old myocardial infarction", "category": "CAD"},
-        {"code": "I20.0",   "description": "Unstable angina", "category": "Angina"},
-        {"code": "I20.9",   "description": "Angina pectoris, unspecified", "category": "Angina"},
-        {"code": "R07.9",   "description": "Chest pain, unspecified", "category": "Symptom"},
-        {"code": "I10",     "description": "Essential (primary) hypertension", "category": "Hypertension"},
-    ],
-    RISK_HIGH: [
-        {"code": "I21.9",   "description": "Acute myocardial infarction, unspecified", "category": "ACS"},
-        {"code": "I21.3",   "description": "ST elevation (STEMI) myocardial infarction", "category": "ACS"},
-        {"code": "I21.4",   "description": "Non-ST elevation (NSTEMI) myocardial infarction", "category": "ACS"},
-        {"code": "I20.0",   "description": "Unstable angina", "category": "Angina"},
-        {"code": "I50.9",   "description": "Heart failure, unspecified", "category": "Heart Failure"},
-        {"code": "I47.2",   "description": "Ventricular tachycardia", "category": "Arrhythmia"},
-        {"code": "I46.9",   "description": "Cardiac arrest, cause unspecified", "category": "Emergency"},
-    ],
+# ─────────────────────────────────────────────
+# Risk Factor Reference
+# ─────────────────────────────────────────────
+
+_RISK_FACTOR_INFO: Dict[str, Dict[str, Any]] = {
+    "age": {
+        "label": "Age",
+        "description": "Cardiovascular risk increases with age",
+        "thresholds": {
+            "male": {"elevated": 45, "high": 65},
+            "female": {"elevated": 55, "high": 65},
+        },
+        "guidance": "Age is a non-modifiable risk factor. Focus on controlling modifiable factors.",
+    },
+    "trestbps": {
+        "label": "Resting Blood Pressure",
+        "description": "Elevated BP increases cardiac workload and arterial damage",
+        "thresholds": {
+            "normal": "<120/80",
+            "elevated": "120-129/<80",
+            "hypertension_stage1": "130-139/80-89",
+            "hypertension_stage2": "≥140/90",
+        },
+        "guidance": "Target BP <130/80 mmHg for most patients with cardiovascular risk.",
+    },
+    "chol": {
+        "label": "Serum Cholesterol",
+        "description": "High cholesterol contributes to atherosclerosis",
+        "thresholds": {
+            "desirable": "<200",
+            "borderline": "200-239",
+            "high": "≥240",
+        },
+        "guidance": "Consider statin therapy based on overall ASCVD risk, not just cholesterol level.",
+    },
+    "thalach": {
+        "label": "Maximum Heart Rate",
+        "description": "Lower achieved heart rate may indicate reduced exercise capacity",
+        "formula": "Predicted max HR = 220 - age",
+        "guidance": "Achieving <85% of predicted max HR may suggest chronotropic incompetence.",
+    },
+    "oldpeak": {
+        "label": "ST Depression",
+        "description": "ST depression during exercise suggests myocardial ischemia",
+        "thresholds": {
+            "normal": "0",
+            "mild": "0.5-1.0",
+            "moderate": "1.0-2.0",
+            "severe": ">2.0",
+        },
+        "guidance": "Significant ST depression warrants further ischemic evaluation.",
+    },
+    "ca": {
+        "label": "Major Vessels",
+        "description": "Number of major coronary vessels with significant stenosis",
+        "guidance": "Higher values indicate more extensive coronary artery disease.",
+    },
+    "thal": {
+        "label": "Thalassemia",
+        "description": "Thallium stress test results",
+        "values": {
+            "normal": "Normal perfusion",
+            "fixed_defect": "Prior myocardial infarction",
+            "reversible_defect": "Inducible ischemia",
+        },
+        "guidance": "Reversible defects suggest viable myocardium at risk.",
+    },
 }
 
-# Lab reference ranges for cardiac workup
-_LAB_RANGES: Dict[str, Dict[str, Any]] = {
-    "Total Cholesterol":    {"low": 0,   "high": 200,  "unit": "mg/dL",  "notes": ">240 = High"},
-    "LDL Cholesterol":      {"low": 0,   "high": 100,  "unit": "mg/dL",  "notes": "<70 target for high-risk"},
-    "HDL Cholesterol (M)":  {"low": 40,  "high": 200,  "unit": "mg/dL",  "notes": "<40 = Low (Men)"},
-    "HDL Cholesterol (F)":  {"low": 50,  "high": 200,  "unit": "mg/dL",  "notes": "<50 = Low (Women)"},
-    "Triglycerides":        {"low": 0,   "high": 150,  "unit": "mg/dL",  "notes": ">500 = Pancreatitis risk"},
-    "Troponin I (hs)":      {"low": 0,   "high": 0.04, "unit": "ng/mL",  "notes": ">0.04 = Myocardial injury"},
-    "BNP":                  {"low": 0,   "high": 100,  "unit": "pg/mL",  "notes": ">400 = Likely HF"},
-    "NT-proBNP":            {"low": 0,   "high": 125,  "unit": "pg/mL",  "notes": "Age-adjusted thresholds"},
-    "HbA1c":                {"low": 0,   "high": 5.6,  "unit": "%",      "notes": "5.7-6.4% = Pre-diabetic"},
-    "Fasting Glucose":      {"low": 70,  "high": 100,  "unit": "mg/dL",  "notes": "100-125 = Pre-diabetic"},
-    "Creatinine":           {"low": 0.7, "high": 1.2,  "unit": "mg/dL",  "notes": "Adjust for sex/age"},
-    "eGFR":                 {"low": 60,  "high": 120,  "unit": "mL/min", "notes": "<60 = CKD stage 3"},
-    "Potassium":            {"low": 3.5, "high": 5.0,  "unit": "mEq/L",  "notes": "Critical: <3.0 or >6.0"},
-    "Sodium":               {"low": 136, "high": 145,  "unit": "mEq/L",  "notes": "<130 worsens HF prognosis"},
-    "INR (on warfarin)":    {"low": 2.0, "high": 3.0,  "unit": "ratio",  "notes": "Therapeutic range for AF/DVT"},
-}
 
-# Lifestyle recommendations by risk level
-_LIFESTYLE: Dict[str, List[str]] = {
-    RISK_LOW: [
-        "150+ minutes/week of moderate aerobic exercise (brisk walking, swimming, cycling)",
-        "DASH or Mediterranean diet: ↑ fruits, vegetables, whole grains; ↓ sodium, saturated fats",
-        "Maintain BMI 18.5–24.9 kg/m²; waist circumference <40 in (M) or <35 in (F)",
-        "Limit alcohol: ≤1 drink/day (women), ≤2 drinks/day (men)",
-        "Complete smoking cessation — even 1 cigarette/day doubles cardiovascular risk",
-        "Stress management: mindfulness, yoga, adequate sleep (7-9 hours/night)",
-        "Monitor blood pressure at home monthly",
-    ],
-    RISK_MEDIUM: [
-        "Cardiac rehabilitation programme — supervised exercise therapy (evidence Level A)",
-        "Sodium restriction: <2,300 mg/day; target <1,500 mg/day if hypertensive",
-        "Saturated fat <7% of total calories; eliminate trans fats completely",
-        "Maintain LDL-C <70 mg/dL through diet + medication combination",
-        "Daily weight monitoring — >2 lbs gain in 24hrs or >5 lbs in 1 week: call cardiologist",
-        "Blood pressure home monitoring daily; log readings for physician review",
-        "Limit caffeine; avoid energy drinks",
-        "Sexual activity guidance — discuss with cardiologist based on exercise tolerance",
-    ],
-    RISK_HIGH: [
-        "🚨 MEDICAL CLEARANCE REQUIRED before any exercise programme",
-        "Complete bed rest during acute phase — no exertion until cardiologist clears",
-        "Strict sodium restriction: <1,500 mg/day (fluid restriction if indicated)",
-        "Daily weight: alert care team if >2 lbs/day increase (fluid retention)",
-        "Zero alcohol — alcohol worsens cardiomyopathy and arrhythmias",
-        "Zero smoking — immediate cessation; Varenicline or NRT with physician guidance",
-        "Supervised cardiac rehabilitation (Phase II) — mandatory after discharge",
-        "Driving restriction — discuss with cardiologist (typically 1-4 weeks post-event)",
-        "Psychological support — depression affects 20-30% of post-MI patients",
-        "Medical alert bracelet recommended for severe cases",
-    ],
-}
+# ─────────────────────────────────────────────
+# Emergency Protocols
+# ─────────────────────────────────────────────
 
-# Emergency referral criteria
-_EMERGENCY_CRITERIA = [
-    "🚨 Chest pain/pressure radiating to arm, jaw, back, or neck",
-    "🚨 Sudden severe shortness of breath at rest",
-    "🚨 Syncope (loss of consciousness) or near-syncope",
-    "🚨 Palpitations with haemodynamic instability (hypotension, diaphoresis)",
-    "🚨 Heart rate >150 bpm or <40 bpm with symptoms",
-    "🚨 Blood pressure >180/120 mmHg (hypertensive emergency) or <90/60 mmHg (shock)",
-    "🚨 ST elevation >1mm in ≥2 contiguous leads on ECG",
-    "🚨 New left bundle branch block with chest pain",
-    "🚨 Troponin rising on serial measurements",
-    "🚨 Acute pulmonary oedema (frothy sputum, severe orthopnoea)",
-    "🚨 Sudden neurological deficit (stroke can mimic/accompany cardiac events)",
-    "🚨 Signs of cardiac tamponade: hypotension + JVD + muffled heart sounds",
-]
+_EMERGENCY_PROTOCOLS: Dict[str, Dict[str, Any]] = {
+    "acs_suspected": {
+        "title": "Suspected Acute Coronary Syndrome",
+        "criteria": [
+            "Chest pain >20 minutes",
+            "Diaphoresis, nausea, dyspnea",
+            "ST elevation or depression on ECG",
+            "Elevated troponin",
+        ],
+        "immediate_actions": [
+            "Activate emergency response",
+            "Administer aspirin 325mg chewed",
+            "Obtain 12-lead ECG within 10 minutes",
+            "Establish IV access",
+            "Monitor vital signs continuously",
+        ],
+        "consult": "Cardiology / Emergency Department immediately",
+    },
+    "heart_failure": {
+        "title": "Acute Heart Failure",
+        "criteria": [
+            "Dyspnea at rest or with minimal exertion",
+            "Orthopnea, PND",
+            "Elevated JVP, pulmonary rales",
+            "Peripheral edema",
+        ],
+        "immediate_actions": [
+            "Position upright",
+            "Supplemental oxygen if SpO2 <90%",
+            "Diuretic therapy",
+            "Consider vasodilators if hypertensive",
+        ],
+        "consult": "Cardiology / Emergency Department",
+    },
+    "arrhythmia": {
+        "title": "Significant Arrhythmia",
+        "criteria": [
+            "Palpitations with hemodynamic compromise",
+            "Syncope or near-syncope",
+            "Heart rate >150 or <40 bpm",
+            "Irregular rhythm with symptoms",
+        ],
+        "immediate_actions": [
+            "Continuous cardiac monitoring",
+            "Assess hemodynamic stability",
+            "Prepare for cardioversion if unstable",
+        ],
+        "consult": "Cardiology / Emergency Department",
+    },
+}
 
 
 # ─────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────
 
-def get_guidelines(risk_level: str) -> GuidelineResult:
+def get_guidelines(risk_level: str) -> Dict[str, Any]:
     """
-    Return ACC/AHA treatment guidelines for a given risk level.
+    Get clinical guidelines for a specific risk level.
 
     Parameters
     ----------
-    risk_level : str  "Low" | "Medium" | "High"
+    risk_level : "LOW" | "MEDIUM" | "HIGH"
 
     Returns
     -------
-    GuidelineResult with recommendations, medications, monitoring, referral.
+    dict with summary, recommendations, follow_up, red_flags
     """
-    data = _GUIDELINES.get(risk_level, _GUIDELINES[RISK_MEDIUM])
-    result = GuidelineResult(
-        risk_level=risk_level,
-        guideline_class=data["guideline_class"],
-        evidence_level=data["evidence_level"],
-        recommendations=data["recommendations"],
-        medications=data["medications"],
-        monitoring=data["monitoring"],
-        referral=data["referral"],
-        source=data["source"],
-    )
-    logger.debug("Guidelines fetched for risk_level=%s", risk_level)
-    return result
+    level = risk_level.upper()
+    if level not in _GUIDELINES:
+        logger.warning("Unknown risk level '%s' — returning MEDIUM guidelines", risk_level)
+        level = "MEDIUM"
+
+    guidelines = _GUIDELINES[level].copy()
+    guidelines["risk_level"] = level
+    guidelines["risk_label"] = RISK_LABELS.get(level, level)
+    return guidelines
 
 
-def check_drug_interactions(drug_list: List[str]) -> List[InteractionAlert]:
-    """
-    Check for known drug-drug interactions among a list of medications.
-
-    Parameters
-    ----------
-    drug_list : List[str]  — medication names (case-insensitive)
-
-    Returns
-    -------
-    List[InteractionAlert] — empty list if no interactions found.
-
-    Example
-    -------
-    alerts = check_drug_interactions(["warfarin", "aspirin", "lisinopril"])
-    """
-    if not drug_list or len(drug_list) < 2:
-        return []
-
-    # Normalise to lowercase for matching
-    normalised = [d.lower().strip() for d in drug_list]
-    alerts: List[InteractionAlert] = []
-
-    for interaction in _DRUG_INTERACTIONS:
-        drug_a, drug_b = interaction["drugs"]
-        # Check if both drugs in the interaction are in the patient's list
-        if drug_a in normalised and drug_b in normalised:
-            alerts.append(InteractionAlert(
-                drug_a=drug_a.title(),
-                drug_b=drug_b.title(),
-                severity=interaction["severity"],
-                description=interaction["description"],
-                action=interaction["action"],
-            ))
-
-    # Sort by severity: Major first
-    severity_order = {"Major": 0, "Moderate": 1, "Minor": 2}
-    alerts.sort(key=lambda a: severity_order.get(a.severity, 99))
-
-    logger.debug(
-        "Drug interaction check: %d drugs → %d alerts", len(drug_list), len(alerts)
-    )
-    return alerts
-
-
-def get_icd10(
+def get_treatment_recommendations(
     risk_level: str,
-    include_all_levels: bool = False,
-) -> List[ICD10Code]:
+    top_factors: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """
-    Return relevant ICD-10-CM codes for the given risk level.
+    Get personalized treatment recommendations based on risk level and factors.
 
     Parameters
     ----------
-    risk_level          : str — "Low" | "Medium" | "High"
-    include_all_levels  : bool — if True, include codes from all risk levels
+    risk_level  : "LOW" | "MEDIUM" | "HIGH"
+    top_factors : list of feature names driving risk
 
     Returns
     -------
-    List[ICD10Code]
+    dict with lifestyle, medication, diagnostic recommendations
     """
-    if include_all_levels:
-        all_codes: List[Dict] = []
-        for codes in _ICD10_CODES.values():
-            all_codes.extend(codes)
-        code_list = all_codes
-    else:
-        code_list = _ICD10_CODES.get(risk_level, _ICD10_CODES[RISK_MEDIUM])
+    level = risk_level.upper()
+    if level not in RISK_LEVELS:
+        level = "MEDIUM"
 
-    result = [
-        ICD10Code(
-            code=c["code"],
-            description=c["description"],
-            category=c["category"],
-        )
-        for c in code_list
-    ]
-    logger.debug("ICD-10 lookup: risk=%s → %d codes", risk_level, len(result))
-    return result
+    recommendations = {
+        "risk_level": level,
+        "risk_label": RISK_LABELS.get(level, level),
+        "lifestyle": _TREATMENT_PROTOCOLS["lifestyle"]["items"],
+        "medication": [],
+        "diagnostic": [],
+    }
+
+    # Filter medications by risk level
+    for med in _TREATMENT_PROTOCOLS["medication"]["items"]:
+        if level in med.get("risk_levels", []):
+            recommendations["medication"].append(med)
+
+    # Filter diagnostics by risk level
+    for diag in _TREATMENT_PROTOCOLS["diagnostic"]["items"]:
+        if level in diag.get("risk_levels", []):
+            recommendations["diagnostic"].append(diag)
+
+    # Add factor-specific guidance
+    if top_factors:
+        factor_guidance = []
+        for factor in top_factors:
+            if factor in _RISK_FACTOR_INFO:
+                info = _RISK_FACTOR_INFO[factor]
+                factor_guidance.append({
+                    "factor": factor,
+                    "label": info["label"],
+                    "guidance": info["guidance"],
+                })
+        recommendations["factor_specific"] = factor_guidance
+
+    return recommendations
 
 
-def get_lab_ranges() -> Dict[str, LabRange]:
+def get_reference_data() -> Dict[str, Any]:
     """
-    Return all cardiac lab reference ranges.
-
-    Returns
-    -------
-    Dict mapping lab name → LabRange object.
+    Get all reference data in one call.
+    Useful for initializing UI reference panels.
     """
     return {
-        name: LabRange(
-            name=name,
-            low=vals["low"],
-            high=vals["high"],
-            unit=vals["unit"],
-            notes=vals.get("notes", ""),
-        )
-        for name, vals in _LAB_RANGES.items()
+        "risk_levels": {
+            k: {"label": v, "range": RISK_LEVELS[k]}
+            for k, v in RISK_LABELS.items()
+        },
+        "chest_pain_types": CHEST_PAIN_LABELS,
+        "thalassemia_types": THAL_LABELS,
+        "restecg_types": RESTECG_LABELS,
+        "feature_labels": FEATURE_LABELS,
+        "emergency_protocols": list(_EMERGENCY_PROTOCOLS.keys()),
     }
 
 
-def flag_patient_labs(patient: Dict[str, Any]) -> Dict[str, str]:
+def get_risk_factor_info(factor: str) -> Optional[Dict[str, Any]]:
     """
-    Flag any patient lab values outside normal reference ranges.
-
-    Checks the clinical features present in the patient dict against
-    the embedded lab ranges. Returns only the flagged values.
-
-    Parameters
-    ----------
-    patient : dict  — patient record with clinical feature values
-
-    Returns
-    -------
-    Dict mapping feature name → flag string ("HIGH ↑", "LOW ↓", "Normal")
+    Get detailed information about a specific risk factor.
     """
-    flags: Dict[str, str] = {}
-    ranges = get_lab_ranges()
+    if factor not in _RISK_FACTOR_INFO:
+        return None
+    info = _RISK_FACTOR_INFO[factor].copy()
+    info["factor"] = factor
+    return info
 
-    # Map patient features to lab names where applicable
-    feature_to_lab = {
-        "chol":     "Total Cholesterol",
-        "trestbps": None,   # Blood pressure — check separately
-        "thalach":  None,   # Heart rate — check separately
+
+def get_emergency_protocols() -> Dict[str, Any]:
+    """
+    Get all emergency protocols.
+    """
+    return {
+        "protocols": _EMERGENCY_PROTOCOLS,
+        "disclaimer": (
+            "These protocols are for reference only. Always follow your "
+            "institution's emergency procedures and consult appropriate specialists."
+        ),
     }
 
-    # Cholesterol check
-    chol = patient.get("chol")
-    if chol is not None:
-        try:
-            chol_val = float(chol)
-            lab = ranges.get("Total Cholesterol")
-            if lab:
-                flag = lab.flag(chol_val)
-                if flag != "Normal":
-                    flags["Total Cholesterol"] = f"{flag} ({chol_val} mg/dL)"
-        except (ValueError, TypeError):
-            pass
 
-    # Blood pressure check (trestbps)
-    trestbps = patient.get("trestbps")
-    if trestbps is not None:
-        try:
-            bp_val = float(trestbps)
-            if bp_val > 140:
-                flags["Resting BP"] = f"HIGH ↑ ({bp_val} mmHg — Stage 2 Hypertension threshold: 140)"
-            elif bp_val > 130:
-                flags["Resting BP"] = f"ELEVATED ({bp_val} mmHg — Stage 1 Hypertension)"
-        except (ValueError, TypeError):
-            pass
-
-    # Heart rate check (thalach)
-    thalach = patient.get("thalach")
-    if thalach is not None:
-        try:
-            hr_val = float(thalach)
-            if hr_val > 100:
-                flags["Max Heart Rate"] = f"HIGH ↑ ({hr_val} bpm — tachycardia threshold: 100)"
-            elif hr_val < 60:
-                flags["Max Heart Rate"] = f"LOW ↓ ({hr_val} bpm — bradycardia threshold: 60)"
-        except (ValueError, TypeError):
-            pass
-
-    return flags
-
-
-def get_lifestyle_advice(risk_level: str) -> List[str]:
+def get_emergency_protocol(protocol_id: str) -> Optional[Dict[str, Any]]:
     """
-    Return evidence-based lifestyle recommendations for a risk level.
-
-    Returns
-    -------
-    List[str]
+    Get a specific emergency protocol by ID.
     """
-    return list(_LIFESTYLE.get(risk_level, _LIFESTYLE[RISK_MEDIUM]))
+    if protocol_id not in _EMERGENCY_PROTOCOLS:
+        return None
+    protocol = _EMERGENCY_PROTOCOLS[protocol_id].copy()
+    protocol["id"] = protocol_id
+    return protocol
 
 
-def get_emergency_criteria() -> List[str]:
+# ─────────────────────────────────────────────
+# Mock API Endpoints
+# For testing UI integration without real API
+# ─────────────────────────────────────────────
+
+def mock_api_call(
+    endpoint: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
-    Return the list of criteria that mandate emergency referral.
+    Simulate an external API call for testing purposes.
 
-    Returns
-    -------
-    List[str] — each item is an actionable emergency trigger.
-    """
-    return list(_EMERGENCY_CRITERIA)
-
-
-def check_emergency_flags(patient: Dict[str, Any]) -> List[str]:
-    """
-    Automatically flag emergency conditions from patient data.
-
-    Checks hard thresholds from the patient vitals and returns
-    any emergency criteria that are met.
+    Supported endpoints:
+        /guidelines           → get_guidelines()
+        /treatments           → get_treatment_recommendations()
+        /reference            → get_reference_data()
+        /risk-factor/{factor} → get_risk_factor_info()
+        /emergency            → get_emergency_protocols()
 
     Parameters
     ----------
-    patient : dict
+    endpoint : API endpoint path
+    params   : Optional query parameters
 
     Returns
     -------
-    List[str] — triggered emergency conditions (empty = no flags)
+    dict with status, data, and mock metadata
     """
-    flags: List[str] = []
+    params = params or {}
+    logger.debug("Mock API call: %s with params %s", endpoint, params)
 
     try:
-        # Blood pressure emergency
-        trestbps = float(patient.get("trestbps", 0))
-        if trestbps >= 180:
-            flags.append(f"🚨 Resting BP = {trestbps} mmHg — Hypertensive Emergency threshold")
+        if endpoint == "/guidelines":
+            risk_level = params.get("risk_level", "MEDIUM")
+            data = get_guidelines(risk_level)
 
-        # Severe tachycardia
-        thalach = float(patient.get("thalach", 0))
-        if thalach > 150:
-            flags.append(f"🚨 Max Heart Rate = {thalach} bpm — Severe tachycardia")
+        elif endpoint == "/treatments":
+            risk_level = params.get("risk_level", "MEDIUM")
+            top_factors = params.get("top_factors", [])
+            data = get_treatment_recommendations(risk_level, top_factors)
 
-        # Exercise-induced angina with high ST depression
-        exang   = int(float(patient.get("exang", 0)))
-        oldpeak = float(patient.get("oldpeak", 0))
-        if exang == 1 and oldpeak > 3.0:
-            flags.append(
-                f"🚨 Exercise-induced angina + ST depression {oldpeak} mm — "
-                "Significant ischaemic burden"
-            )
+        elif endpoint == "/reference":
+            data = get_reference_data()
 
-        # Multiple vessel disease indicators
-        ca = int(float(patient.get("ca", 0)))
-        if ca >= 3:
-            flags.append(f"🚨 {ca} major vessels affected — likely multivessel disease")
+        elif endpoint.startswith("/risk-factor/"):
+            factor = endpoint.split("/")[-1]
+            data = get_risk_factor_info(factor)
+            if data is None:
+                return {
+                    "status": "error",
+                    "code": 404,
+                    "message": f"Risk factor '{factor}' not found",
+                    "data": None,
+                }
 
-        # Reversible thalassemia defect (worst prognosis)
-        thal = int(float(patient.get("thal", 0)))
-        if thal == 2:
-            flags.append("🚨 Reversible thalassemia defect — indicates active myocardial ischaemia")
+        elif endpoint == "/emergency":
+            data = get_emergency_protocols()
 
-    except (ValueError, TypeError) as exc:
-        logger.warning("Emergency flag check error: %s", exc)
+        elif endpoint.startswith("/emergency/"):
+            protocol_id = endpoint.split("/")[-1]
+            data = get_emergency_protocol(protocol_id)
+            if data is None:
+                return {
+                    "status": "error",
+                    "code": 404,
+                    "message": f"Protocol '{protocol_id}' not found",
+                    "data": None,
+                }
 
-    return flags
+        else:
+            return {
+                "status": "error",
+                "code": 404,
+                "message": f"Unknown endpoint '{endpoint}'",
+                "data": None,
+            }
+
+        return {
+            "status": "success",
+            "code": 200,
+            "message": "OK",
+            "data": data,
+            "meta": {
+                "source": "mock_api",
+                "endpoint": endpoint,
+                "timestamp": "2024-01-01T00:00:00Z",
+            },
+        }
+
+    except Exception as exc:
+        logger.error("Mock API error: %s", exc)
+        return {
+            "status": "error",
+            "code": 500,
+            "message": f"Internal error: {exc}",
+            "data": None,
+        }
 
 
-def get_full_clinical_brief(
-    patient:     Dict[str, Any],
-    risk_level:  str,
-    drug_list:   Optional[List[str]] = None,
-) -> ClinicalBrief:
+# ─────────────────────────────────────────────
+# Convenience wrappers for UI
+# ─────────────────────────────────────────────
+
+def get_patient_care_plan(
+    risk_level: str,
+    top_factors: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """
-    Generate a complete clinical reference package for one patient.
+    Generate a comprehensive care plan for a patient.
+    Combines guidelines, treatments, and factor-specific guidance.
 
-    Combines guidelines + drug interactions + ICD-10 + lab flags +
-    lifestyle + emergency flags into a single ClinicalBrief object.
-
-    Parameters
-    ----------
-    patient    : dict  — patient record
-    risk_level : str   — from risk_model.py
-    drug_list  : list  — current medications (optional)
-
-    Returns
-    -------
-    ClinicalBrief
+    Used by ui/diagnosis_view.py for the care plan panel.
     """
-    guidelines   = get_guidelines(risk_level)
-    interactions = check_drug_interactions(drug_list or [])
-    icd10_codes  = get_icd10(risk_level)
-    lab_flags    = flag_patient_labs(patient)
-    lifestyle    = get_lifestyle_advice(risk_level)
-    emergency    = check_emergency_flags(patient)
+    guidelines = get_guidelines(risk_level)
+    treatments = get_treatment_recommendations(risk_level, top_factors)
 
-    logger.info(
-        "Clinical brief generated: risk=%s | %d interactions | %d lab flags | %d emergency flags",
-        risk_level, len(interactions), len(lab_flags), len(emergency),
-    )
+    return {
+        "risk_level": risk_level,
+        "risk_label": RISK_LABELS.get(risk_level.upper(), risk_level),
+        "summary": guidelines["summary"],
+        "acc_aha_class": guidelines["acc_aha_class"],
+        "immediate_actions": guidelines["recommendations"][:2],
+        "follow_up": guidelines["follow_up"],
+        "red_flags": guidelines["red_flags"],
+        "lifestyle": treatments["lifestyle"],
+        "medications": treatments["medication"],
+        "diagnostics": treatments["diagnostic"],
+        "factor_guidance": treatments.get("factor_specific", []),
+        "disclaimer": (
+            "This care plan is AI-generated and must be reviewed by a "
+            "licensed physician before implementation."
+        ),
+    }
 
-    return ClinicalBrief(
-        risk_level=risk_level,
-        guidelines=guidelines,
-        interactions=interactions,
-        icd10_codes=icd10_codes,
-        lab_flags=lab_flags,
-        lifestyle=lifestyle,
-        emergency_flags=emergency,
-    )
+
+def get_risk_education(risk_level: str) -> Dict[str, Any]:
+    """
+    Get patient-friendly education content for a risk level.
+    Used for patient education materials.
+    """
+    level = risk_level.upper()
+    guidelines = get_guidelines(level)
+
+    education = {
+        "risk_level": level,
+        "title": f"Understanding Your {RISK_LABELS.get(level, level)} Assessment",
+        "what_this_means": guidelines["summary"],
+        "what_you_can_do": [
+            rec.replace("Consider", "Talk to your doctor about")
+            for rec in guidelines["recommendations"][:3]
+        ],
+        "warning_signs": guidelines["red_flags"],
+        "when_to_seek_help": (
+            "Seek immediate medical attention if you experience chest pain, "
+            "severe shortness of breath, or fainting."
+        ),
+    }
+    return education

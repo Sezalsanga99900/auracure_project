@@ -1,624 +1,491 @@
-"""
-database/local_db.py
-────────────────────
-Local SQLite database for AuraEcho+ patient records.
+# =============================================================================
+# database/local_db.py
+# AuraEcho+ — SQLite Local Storage Engine
+#
+# Responsibility:
+#     Manage local persistence of patients, predictions, and the sync queue.
+#     Provides offline-first storage that syncs to cloud when online.
+#
+# Schema:
+#     patients      — patient demographics + feature JSON
+#     predictions   — risk results + AI responses linked to patients
+#     sync_queue    — pending operations for cloud sync
+#
+# Public API:
+#     init_db()                     → None
+#     save_patient(patient)         → int (patient_id)
+#     get_patient(patient_id)       → dict
+#     get_all_patients()            → list[dict]
+#     save_prediction(patient_id, risk, ai) → int
+#     get_patient_history(patient_id) → list[dict]
+#     add_to_sync_queue(table, record_id, op) → None
+#     get_pending_sync(limit)       → list[dict]
+#     mark_synced(queue_id)         → None
+#     export_to_csv()               → str (path)
+# =============================================================================
 
-Responsibility:
-    Persist patient records, AI diagnoses, and risk assessments locally
-    — completely offline, zero cloud dependency. Acts as the primary
-    data store in offline mode and as the write-ahead buffer in online
-    mode (records are later synced to Firebase by sync_service.py).
-
-Database schema:
-    ┌─────────────────────────────────────────────────────────┐
-    │  TABLE: patients                                        │
-    │    id           INTEGER PRIMARY KEY AUTOINCREMENT       │
-    │    patient_id   TEXT UNIQUE  (UUID)                     │
-    │    name         TEXT                                    │
-    │    age          INTEGER                                 │
-    │    sex          TEXT                                    │
-    │    created_at   TEXT  (ISO-8601)                        │
-    │    updated_at   TEXT  (ISO-8601)                        │
-    │    synced       INTEGER  0=not synced, 1=synced         │
-    │    raw_data     TEXT  (full JSON blob)                  │
-    ├─────────────────────────────────────────────────────────┤
-    │  TABLE: assessments                                     │
-    │    id              INTEGER PRIMARY KEY AUTOINCREMENT    │
-    │    assessment_id   TEXT UNIQUE  (UUID)                  │
-    │    patient_id      TEXT  (FK → patients.patient_id)     │
-    │    risk_level      TEXT                                 │
-    │    confidence_pct  REAL                                 │
-    │    disease_prob    REAL                                 │
-    │    ai_diagnosis    TEXT  (AI response JSON)             │
-    │    similar_cases   TEXT  (JSON array)                   │
-    │    created_at      TEXT                                 │
-    │    synced          INTEGER                              │
-    └─────────────────────────────────────────────────────────┘
-
-Public API:
-    save_patient(patient_dict)              → patient_id: str
-    get_patient(patient_id)                 → dict | None
-    get_all_patients(limit, offset)         → List[dict]
-    save_assessment(patient_id, assessment) → assessment_id: str
-    get_assessments(patient_id)             → List[dict]
-    get_unsynced_records()                  → List[dict]
-    mark_synced(record_id, table)           → None
-    search_patients(query)                  → List[dict]
-    delete_patient(patient_id)             → bool
-    export_to_csv(filepath)                → str
-    get_stats()                            → dict
-"""
-
-import csv
-import json
 import os
+import json
 import sqlite3
-import uuid
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+import threading
+import pandas as pd
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils.constants import (
     LOCAL_DB_PATH,
-    DB_PATIENTS_TABLE,
-    DB_ASSESSMENTS_TABLE,
+    LOCAL_CSV_BACKUP_PATH,
+    DB_TABLE_PATIENTS,
+    DB_TABLE_PREDICTIONS,
+    DB_TABLE_SYNC_QUEUE,
+    DATE_FORMAT,
+    SYNC_BATCH_SIZE,
 )
-from utils.helpers import get_logger
+from utils.helpers import get_logger, ensure_dir, now_str
 
 logger = get_logger(__name__)
 
-
-# ─────────────────────────────────────────────
-# Schema DDL
-# ─────────────────────────────────────────────
-
-_CREATE_PATIENTS_TABLE = """
-CREATE TABLE IF NOT EXISTS patients (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    patient_id   TEXT    NOT NULL UNIQUE,
-    name         TEXT    NOT NULL DEFAULT 'Unknown',
-    age          INTEGER,
-    sex          TEXT,
-    created_at   TEXT    NOT NULL,
-    updated_at   TEXT    NOT NULL,
-    synced       INTEGER NOT NULL DEFAULT 0,
-    raw_data     TEXT    NOT NULL
-);
-"""
-
-_CREATE_ASSESSMENTS_TABLE = """
-CREATE TABLE IF NOT EXISTS assessments (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    assessment_id   TEXT    NOT NULL UNIQUE,
-    patient_id      TEXT    NOT NULL,
-    risk_level      TEXT,
-    confidence_pct  REAL,
-    disease_prob    REAL,
-    ai_source       TEXT,
-    ai_diagnosis    TEXT,
-    similar_cases   TEXT,
-    created_at      TEXT    NOT NULL,
-    synced          INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (patient_id) REFERENCES patients(patient_id)
-);
-"""
-
-_CREATE_INDEXES = [
-    "CREATE INDEX IF NOT EXISTS idx_patients_patient_id ON patients(patient_id);",
-    "CREATE INDEX IF NOT EXISTS idx_patients_name       ON patients(name);",
-    "CREATE INDEX IF NOT EXISTS idx_assessments_patient ON assessments(patient_id);",
-    "CREATE INDEX IF NOT EXISTS idx_patients_synced     ON patients(synced);",
-    "CREATE INDEX IF NOT EXISTS idx_assessments_synced  ON assessments(synced);",
-]
+# Thread lock for write operations (SQLite is thread-safe for reads,
+# but concurrent writes need serialization in Streamlit)
+_db_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────────
-# Database initialisation
+# Connection helper
 # ─────────────────────────────────────────────
 
-def _ensure_db_dir() -> None:
-    """Create the directory for LOCAL_DB_PATH if it doesn't exist."""
-    db_dir = Path(LOCAL_DB_PATH).parent
-    db_dir.mkdir(parents=True, exist_ok=True)
+def _get_connection() -> sqlite3.Connection:
+    """
+    Get a database connection with row factory and foreign keys enabled.
+    Creates the database file if it doesn't exist.
+    """
+    ensure_dir(os.path.dirname(LOCAL_DB_PATH))
+    conn = sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
+
+# ─────────────────────────────────────────────
+# Schema initialization
+# ─────────────────────────────────────────────
 
 def init_db() -> None:
     """
-    Create tables and indexes if they don't exist.
-    Safe to call multiple times (all statements use IF NOT EXISTS).
+    Create all tables if they don't exist.
+    Call this once at app startup.
     """
-    _ensure_db_dir()
-    with _get_connection() as conn:
-        conn.execute(_CREATE_PATIENTS_TABLE)
-        conn.execute(_CREATE_ASSESSMENTS_TABLE)
-        for idx_sql in _CREATE_INDEXES:
-            conn.execute(idx_sql)
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+
+        # Patients table
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {DB_TABLE_PATIENTS} (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                age         INTEGER,
+                sex         INTEGER,
+                features    TEXT NOT NULL,          -- JSON blob of all clinical features
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+        """)
+
+        # Predictions table
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {DB_TABLE_PREDICTIONS} (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id      INTEGER NOT NULL,
+                risk_level      TEXT NOT NULL,
+                risk_score      REAL NOT NULL,
+                predicted_label INTEGER NOT NULL,
+                risk_result     TEXT NOT NULL,      -- JSON blob of RiskResult
+                ai_response     TEXT,               -- JSON blob of AIResponse (nullable)
+                created_at      TEXT NOT NULL,
+                FOREIGN KEY (patient_id) REFERENCES {DB_TABLE_PATIENTS}(id) ON DELETE CASCADE
+            )
+        """)
+
+        # Sync queue table
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {DB_TABLE_SYNC_QUEUE} (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name  TEXT NOT NULL,          -- 'patients' or 'predictions'
+                record_id   INTEGER NOT NULL,       -- ID in the source table
+                operation   TEXT NOT NULL,          -- 'INSERT' | 'UPDATE' | 'DELETE'
+                status      TEXT NOT NULL DEFAULT 'PENDING',
+                retry_count INTEGER DEFAULT 0,
+                created_at  TEXT NOT NULL,
+                synced_at   TEXT,
+                error_msg   TEXT
+            )
+        """)
+
+        # Indexes for performance
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_pred_patient ON {DB_TABLE_PREDICTIONS}(patient_id)")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_sync_status ON {DB_TABLE_SYNC_QUEUE}(status)")
+
         conn.commit()
-    logger.info("Local database initialised at %s", LOCAL_DB_PATH)
-
-
-@contextmanager
-def _get_connection() -> Generator[sqlite3.Connection, None, None]:
-    """
-    Context manager that yields a SQLite connection with sensible defaults.
-
-    - WAL mode for concurrent reads
-    - Row factory for dict-style row access
-    - Foreign key enforcement
-    """
-    _ensure_db_dir()
-    conn = sqlite3.connect(LOCAL_DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    try:
-        yield conn
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
         conn.close()
+        logger.info("Database initialized at %s", LOCAL_DB_PATH)
 
 
 # ─────────────────────────────────────────────
-# Internal helpers
+# Patient operations
 # ─────────────────────────────────────────────
 
-def _now_iso() -> str:
-    """Return current UTC time as ISO-8601 string."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _generate_id(prefix: str = "") -> str:
-    """Generate a unique ID like 'pat_3f2a...' or 'asmnt_7c1b...'"""
-    return f"{prefix}{uuid.uuid4().hex[:16]}"
-
-
-def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    """Convert a sqlite3.Row to a plain dict."""
-    return dict(row)
-
-
-def _deserialise_patient_row(row: Dict[str, Any]) -> Dict[str, Any]:
+def save_patient(patient: Dict[str, Any]) -> int:
     """
-    Expand the raw_data JSON blob back into a full patient dict.
-    Merges DB columns with raw_data for convenience.
-    """
-    result = dict(row)
-    raw_data_str = result.pop("raw_data", "{}")
-    try:
-        raw_data = json.loads(raw_data_str)
-    except (json.JSONDecodeError, TypeError):
-        raw_data = {}
-    result.update(raw_data)   # raw_data fields fill in clinical features
-    return result
-
-
-def _deserialise_assessment_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Expand JSON blobs in an assessment row."""
-    result = dict(row)
-
-    for json_field in ("ai_diagnosis", "similar_cases"):
-        val = result.get(json_field)
-        if isinstance(val, str):
-            try:
-                result[json_field] = json.loads(val)
-            except (json.JSONDecodeError, TypeError):
-                result[json_field] = {}
-
-    return result
-
-
-# ─────────────────────────────────────────────
-# Patient CRUD
-# ─────────────────────────────────────────────
-
-def save_patient(patient: Dict[str, Any]) -> str:
-    """
-    Insert or update a patient record.
-
-    If the patient dict already has a 'patient_id' key, it will be
-    treated as an UPDATE (upsert).  Otherwise a new UUID is generated.
+    Insert a new patient record.
 
     Parameters
     ----------
-    patient : dict
-        Must contain clinical feature fields.
-        May optionally contain: name, patient_id.
+    patient : dict with keys: name, age, sex, and all FEATURE_COLUMNS
 
     Returns
     -------
-    patient_id : str  — the UUID assigned to this patient
+    patient_id : int
     """
-    init_db()
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
 
-    patient_id = patient.get("patient_id") or _generate_id("pat_")
-    name       = str(patient.get("name", "Unknown Patient"))
-    age        = int(float(patient.get("age", 0)))
-    sex_raw    = patient.get("sex", 0)
-    sex_label  = "Male" if int(float(sex_raw)) == 1 else "Female"
-    now        = _now_iso()
+        now = now_str()
+        name = patient.get("name", "Unknown")
+        age = patient.get("age")
+        sex = patient.get("sex")
 
-    # Full patient data as JSON blob (including all clinical features)
-    raw_data = json.dumps({k: v for k, v in patient.items()})
+        # Store all features as JSON (flexible schema)
+        features_json = json.dumps(patient, default=str)
 
-    sql = """
-    INSERT INTO patients (patient_id, name, age, sex, created_at, updated_at, synced, raw_data)
-    VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-    ON CONFLICT(patient_id) DO UPDATE SET
-        name       = excluded.name,
-        age        = excluded.age,
-        sex        = excluded.sex,
-        updated_at = excluded.updated_at,
-        synced     = 0,
-        raw_data   = excluded.raw_data
-    """
+        cursor.execute(f"""
+            INSERT INTO {DB_TABLE_PATIENTS}
+            (name, age, sex, features, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (name, age, sex, features_json, now, now))
 
-    with _get_connection() as conn:
-        conn.execute(sql, (patient_id, name, age, sex_label, now, now, raw_data))
+        patient_id = cursor.lastrowid
+
+        # Add to sync queue
+        _add_to_sync_queue_internal(cursor, DB_TABLE_PATIENTS, patient_id, "INSERT")
+
         conn.commit()
+        conn.close()
+        logger.info("Saved patient id=%d name='%s'", patient_id, name)
+        return patient_id
 
-    logger.info("Patient saved: id=%s name=%s", patient_id, name)
-    return patient_id
 
-
-def get_patient(patient_id: str) -> Optional[Dict[str, Any]]:
+def get_patient(patient_id: int) -> Optional[Dict[str, Any]]:
     """
-    Retrieve a single patient by patient_id.
-
-    Returns
-    -------
-    Full patient dict (DB columns + clinical features), or None.
+    Retrieve a patient by ID.
+    Returns None if not found.
     """
-    init_db()
-
-    with _get_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM patients WHERE patient_id = ?", (patient_id,)
-        ).fetchone()
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT * FROM {DB_TABLE_PATIENTS} WHERE id = ?
+    """, (patient_id,))
+    row = cursor.fetchone()
+    conn.close()
 
     if row is None:
         return None
-    return _deserialise_patient_row(_row_to_dict(row))
+
+    patient = dict(row)
+    patient["features"] = json.loads(patient["features"])
+    return patient
 
 
-def get_all_patients(
-    limit: int = 100,
-    offset: int = 0,
-    synced_only: bool = False,
-) -> List[Dict[str, Any]]:
+def get_all_patients(limit: int = 100) -> List[Dict[str, Any]]:
     """
-    Retrieve paginated list of all patients.
-
-    Parameters
-    ----------
-    limit       : max records to return
-    offset      : skip first N records (for pagination)
-    synced_only : if True, return only cloud-synced records
-
-    Returns
-    -------
-    List of patient dicts, newest first.
+    Get all patients ordered by created_at descending.
     """
-    init_db()
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT * FROM {DB_TABLE_PATIENTS}
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
 
-    where = "WHERE synced = 1" if synced_only else ""
-    sql   = f"SELECT * FROM patients {where} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    patients = []
+    for row in rows:
+        p = dict(row)
+        p["features"] = json.loads(p["features"])
+        patients.append(p)
+    return patients
 
-    with _get_connection() as conn:
-        rows = conn.execute(sql, (limit, offset)).fetchall()
 
-    return [_deserialise_patient_row(_row_to_dict(r)) for r in rows]
-
-
-def search_patients(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+def search_patients(query: str, limit: int = 50) -> List[Dict[str, Any]]:
     """
-    Full-text search on patient name.
-
-    Parameters
-    ----------
-    query : str  — search string (case-insensitive, partial match)
-    limit : int  — max results
-
-    Returns
-    -------
-    List of matching patient dicts.
+    Search patients by name.
     """
-    init_db()
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT * FROM {DB_TABLE_PATIENTS}
+        WHERE name LIKE ?
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (f"%{query}%", limit))
+    rows = cursor.fetchall()
+    conn.close()
 
-    pattern = f"%{query.strip()}%"
-    sql = "SELECT * FROM patients WHERE name LIKE ? ORDER BY created_at DESC LIMIT ?"
-
-    with _get_connection() as conn:
-        rows = conn.execute(sql, (pattern, limit)).fetchall()
-
-    return [_deserialise_patient_row(_row_to_dict(r)) for r in rows]
-
-
-def delete_patient(patient_id: str) -> bool:
-    """
-    Delete a patient and all their assessments.
-
-    Returns
-    -------
-    True if a record was deleted, False if not found.
-    """
-    init_db()
-
-    with _get_connection() as conn:
-        # Delete assessments first (FK constraint)
-        conn.execute(
-            "DELETE FROM assessments WHERE patient_id = ?", (patient_id,)
-        )
-        cursor = conn.execute(
-            "DELETE FROM patients WHERE patient_id = ?", (patient_id,)
-        )
-        conn.commit()
-        deleted = cursor.rowcount > 0
-
-    if deleted:
-        logger.info("Patient deleted: id=%s", patient_id)
-    else:
-        logger.warning("Delete called on non-existent patient: %s", patient_id)
-
-    return deleted
+    patients = []
+    for row in rows:
+        p = dict(row)
+        p["features"] = json.loads(p["features"])
+        patients.append(p)
+    return patients
 
 
 # ─────────────────────────────────────────────
-# Assessment CRUD
+# Prediction operations
 # ─────────────────────────────────────────────
 
-def save_assessment(
-    patient_id:    str,
-    risk_result:   Optional[Dict[str, Any]]   = None,
-    ai_response:   Optional[Dict[str, Any]]   = None,
-    similar_cases: Optional[List[Dict[str, Any]]] = None,
-) -> str:
+def save_prediction(
+    patient_id:    int,
+    risk_result:   Dict[str, Any],
+    ai_response:   Optional[Dict[str, Any]] = None,
+) -> int:
     """
-    Save a clinical assessment linked to a patient.
+    Save a prediction result for a patient.
 
     Parameters
     ----------
-    patient_id    : str  — must exist in patients table
-    risk_result   : RiskResult.to_dict()
-    ai_response   : AIResponse.to_dict()
-    similar_cases : list of SimilarCase.to_dict()
+    patient_id  : int
+    risk_result : RiskResult.to_dict()
+    ai_response : AIResponse.to_dict() or None
 
     Returns
     -------
-    assessment_id : str
+    prediction_id : int
     """
-    init_db()
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
 
-    assessment_id  = _generate_id("asmnt_")
-    risk_level     = risk_result.get("risk_level", "Unknown") if risk_result else "Unknown"
-    confidence_pct = risk_result.get("confidence_pct", 0.0)   if risk_result else 0.0
-    disease_prob   = risk_result.get("disease_prob", 0.0)      if risk_result else 0.0
-    ai_source      = ai_response.get("source", "unknown")      if ai_response else "none"
-    now            = _now_iso()
+        now = now_str()
+        risk_json = json.dumps(risk_result, default=str)
+        ai_json   = json.dumps(ai_response, default=str) if ai_response else None
 
-    ai_json      = json.dumps(ai_response or {})
-    similar_json = json.dumps(similar_cases or [])
+        risk_level   = risk_result.get("risk_level", "UNKNOWN")
+        risk_score   = risk_result.get("disease_prob", 0.0)
+        pred_label   = risk_result.get("predicted_label", 0)
 
-    sql = """
-    INSERT INTO assessments
-        (assessment_id, patient_id, risk_level, confidence_pct, disease_prob,
-         ai_source, ai_diagnosis, similar_cases, created_at, synced)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-    """
+        cursor.execute(f"""
+            INSERT INTO {DB_TABLE_PREDICTIONS}
+            (patient_id, risk_level, risk_score, predicted_label,
+             risk_result, ai_response, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (patient_id, risk_level, risk_score, pred_label, risk_json, ai_json, now))
 
-    with _get_connection() as conn:
-        conn.execute(sql, (
-            assessment_id, patient_id, risk_level, confidence_pct, disease_prob,
-            ai_source, ai_json, similar_json, now,
-        ))
+        prediction_id = cursor.lastrowid
+
+        # Add to sync queue
+        _add_to_sync_queue_internal(cursor, DB_TABLE_PREDICTIONS, prediction_id, "INSERT")
+
         conn.commit()
+        conn.close()
+        logger.info(
+            "Saved prediction id=%d patient=%d risk=%s",
+            prediction_id, patient_id, risk_level,
+        )
+        return prediction_id
 
-    logger.info(
-        "Assessment saved: id=%s patient=%s risk=%s",
-        assessment_id, patient_id, risk_level,
+
+def get_patient_history(patient_id: int) -> List[Dict[str, Any]]:
+    """
+    Get all predictions for a patient, ordered by created_at descending.
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT * FROM {DB_TABLE_PREDICTIONS}
+        WHERE patient_id = ?
+        ORDER BY created_at DESC
+    """, (patient_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    history = []
+    for row in rows:
+        h = dict(row)
+        h["risk_result"] = json.loads(h["risk_result"])
+        h["ai_response"] = json.loads(h["ai_response"]) if h["ai_response"] else None
+        history.append(h)
+    return history
+
+
+def get_recent_predictions(limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Get recent predictions across all patients with patient name joined.
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT p.*, pat.name as patient_name, pat.age, pat.sex
+        FROM {DB_TABLE_PREDICTIONS} p
+        JOIN {DB_TABLE_PATIENTS} pat ON p.patient_id = pat.id
+        ORDER BY p.created_at DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    results = []
+    for row in rows:
+        r = dict(row)
+        r["risk_result"] = json.loads(r["risk_result"])
+        r["ai_response"] = json.loads(r["ai_response"]) if r["ai_response"] else None
+        results.append(r)
+    return results
+
+
+# ─────────────────────────────────────────────
+# Sync queue operations
+# ─────────────────────────────────────────────
+
+def _add_to_sync_queue_internal(
+    cursor:    sqlite3.Cursor,
+    table:     str,
+    record_id: int,
+    operation: str,
+) -> None:
+    """Internal helper to add to sync queue (assumes cursor is active)."""
+    now = now_str()
+    cursor.execute(f"""
+        INSERT INTO {DB_TABLE_SYNC_QUEUE}
+        (table_name, record_id, operation, status, created_at)
+        VALUES (?, ?, ?, 'PENDING', ?)
+    """, (table, record_id, operation, now))
+
+
+def add_to_sync_queue(table: str, record_id: int, operation: str) -> None:
+    """
+    Public API to add an item to the sync queue.
+    Used by services that modify data outside the main save functions.
+    """
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        _add_to_sync_queue_internal(cursor, table, record_id, operation)
+        conn.commit()
+        conn.close()
+
+
+def get_pending_sync(limit: int = SYNC_BATCH_SIZE) -> List[Dict[str, Any]]:
+    """
+    Get pending sync items ordered by created_at.
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT * FROM {DB_TABLE_SYNC_QUEUE}
+        WHERE status = 'PENDING'
+        ORDER BY created_at ASC
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def mark_synced(queue_id: int) -> None:
+    """
+    Mark a sync queue item as synced.
+    """
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        now = now_str()
+        cursor.execute(f"""
+            UPDATE {DB_TABLE_SYNC_QUEUE}
+            SET status = 'SYNCED', synced_at = ?
+            WHERE id = ?
+        """, (now, queue_id))
+        conn.commit()
+        conn.close()
+
+
+def mark_sync_failed(queue_id: int, error: str) -> None:
+    """
+    Mark a sync queue item as failed and increment retry count.
+    """
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            UPDATE {DB_TABLE_SYNC_QUEUE}
+            SET status = 'FAILED', retry_count = retry_count + 1, error_msg = ?
+            WHERE id = ?
+        """, (error, queue_id))
+        conn.commit()
+        conn.close()
+
+
+def get_sync_stats() -> Dict[str, int]:
+    """
+    Get counts of sync queue items by status.
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT status, COUNT(*) as cnt
+        FROM {DB_TABLE_SYNC_QUEUE}
+        GROUP BY status
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return {row["status"]: row["cnt"] for row in rows}
+
+
+# ─────────────────────────────────────────────
+# Export / Backup
+# ─────────────────────────────────────────────
+
+def export_to_csv() -> str:
+    """
+    Export all patients and predictions to a CSV backup file.
+    Returns the path to the backup file.
+    """
+    ensure_dir(os.path.dirname(LOCAL_CSV_BACKUP_PATH))
+
+    conn = _get_connection()
+    patients_df = pd.read_sql_query(f"SELECT * FROM {DB_TABLE_PATIENTS}", conn)
+    predictions_df = pd.read_sql_query(f"SELECT * FROM {DB_TABLE_PREDICTIONS}", conn)
+    conn.close()
+
+    # Expand JSON columns
+    if "features" in patients_df.columns:
+        features_expanded = pd.json_normalize(patients_df["features"].apply(json.loads))
+        patients_df = pd.concat([patients_df.drop(columns=["features"]), features_expanded], axis=1)
+
+    if "risk_result" in predictions_df.columns:
+        risk_expanded = pd.json_normalize(predictions_df["risk_result"].apply(json.loads))
+        predictions_df = pd.concat([predictions_df.drop(columns=["risk_result"]), risk_expanded], axis=1)
+
+    # Merge
+    merged = predictions_df.merge(
+        patients_df.add_prefix("patient_"),
+        left_on="patient_id",
+        right_on="patient_id",
+        how="left",
     )
-    return assessment_id
 
-
-def get_assessments(
-    patient_id: str,
-    limit: int = 20,
-) -> List[Dict[str, Any]]:
-    """
-    Retrieve all assessments for a patient, newest first.
-
-    Returns
-    -------
-    List of assessment dicts with expanded JSON fields.
-    """
-    init_db()
-
-    sql = """
-    SELECT * FROM assessments
-    WHERE patient_id = ?
-    ORDER BY created_at DESC
-    LIMIT ?
-    """
-
-    with _get_connection() as conn:
-        rows = conn.execute(sql, (patient_id, limit)).fetchall()
-
-    return [_deserialise_assessment_row(_row_to_dict(r)) for r in rows]
-
-
-def get_latest_assessment(patient_id: str) -> Optional[Dict[str, Any]]:
-    """Return the most recent assessment for a patient, or None."""
-    assessments = get_assessments(patient_id, limit=1)
-    return assessments[0] if assessments else None
-
-
-# ─────────────────────────────────────────────
-# Sync support
-# ─────────────────────────────────────────────
-
-def get_unsynced_records() -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Return all records not yet pushed to the cloud.
-
-    Returns
-    -------
-    dict:
-        patients    : list of unsynced patient dicts
-        assessments : list of unsynced assessment dicts
-    """
-    init_db()
-
-    with _get_connection() as conn:
-        patient_rows = conn.execute(
-            "SELECT * FROM patients WHERE synced = 0 ORDER BY created_at ASC"
-        ).fetchall()
-        assessment_rows = conn.execute(
-            "SELECT * FROM assessments WHERE synced = 0 ORDER BY created_at ASC"
-        ).fetchall()
-
-    patients    = [_deserialise_patient_row(_row_to_dict(r)) for r in patient_rows]
-    assessments = [_deserialise_assessment_row(_row_to_dict(r)) for r in assessment_rows]
-
-    logger.debug("Unsynced: %d patients, %d assessments", len(patients), len(assessments))
-    return {"patients": patients, "assessments": assessments}
-
-
-def mark_synced(record_id: str, table: str = "patients") -> None:
-    """
-    Mark a record as successfully synced to the cloud.
-
-    Parameters
-    ----------
-    record_id : str  — patient_id or assessment_id
-    table     : str  — "patients" or "assessments"
-    """
-    init_db()
-
-    if table == "patients":
-        id_col = "patient_id"
-    elif table == "assessments":
-        id_col = "assessment_id"
-    else:
-        raise ValueError(f"Unknown table: {table}")
-
-    with _get_connection() as conn:
-        conn.execute(
-            f"UPDATE {table} SET synced = 1 WHERE {id_col} = ?",
-            (record_id,),
-        )
-        conn.commit()
-
-    logger.debug("Marked synced: table=%s id=%s", table, record_id)
-
-
-# ─────────────────────────────────────────────
-# Analytics + export
-# ─────────────────────────────────────────────
-
-def get_stats() -> Dict[str, Any]:
-    """
-    Return summary statistics about the local database.
-
-    Returns
-    -------
-    dict:
-        total_patients      : int
-        total_assessments   : int
-        unsynced_patients   : int
-        unsynced_assessments: int
-        high_risk_count     : int
-        medium_risk_count   : int
-        low_risk_count      : int
-        db_size_kb          : float
-    """
-    init_db()
-
-    with _get_connection() as conn:
-        total_patients       = conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0]
-        total_assessments    = conn.execute("SELECT COUNT(*) FROM assessments").fetchone()[0]
-        unsynced_patients    = conn.execute("SELECT COUNT(*) FROM patients    WHERE synced=0").fetchone()[0]
-        unsynced_assessments = conn.execute("SELECT COUNT(*) FROM assessments WHERE synced=0").fetchone()[0]
-        high_risk   = conn.execute("SELECT COUNT(*) FROM assessments WHERE risk_level='High'").fetchone()[0]
-        medium_risk = conn.execute("SELECT COUNT(*) FROM assessments WHERE risk_level='Medium'").fetchone()[0]
-        low_risk    = conn.execute("SELECT COUNT(*) FROM assessments WHERE risk_level='Low'").fetchone()[0]
-
-    db_size_kb = os.path.getsize(LOCAL_DB_PATH) / 1024 if os.path.exists(LOCAL_DB_PATH) else 0.0
-
-    return {
-        "total_patients":       total_patients,
-        "total_assessments":    total_assessments,
-        "unsynced_patients":    unsynced_patients,
-        "unsynced_assessments": unsynced_assessments,
-        "high_risk_count":      high_risk,
-        "medium_risk_count":    medium_risk,
-        "low_risk_count":       low_risk,
-        "db_size_kb":           round(db_size_kb, 2),
-    }
-
-
-def export_to_csv(filepath: Optional[str] = None) -> str:
-    """
-    Export all patient records (with latest risk assessment) to CSV.
-
-    Parameters
-    ----------
-    filepath : str  — output path (default: data/exports/patients_export.csv)
-
-    Returns
-    -------
-    Absolute path to the exported CSV file.
-    """
-    init_db()
-
-    if filepath is None:
-        export_dir = Path("data/exports")
-        export_dir.mkdir(parents=True, exist_ok=True)
-        timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath   = str(export_dir / f"patients_export_{timestamp}.csv")
-
-    patients = get_all_patients(limit=10_000)
-
-    if not patients:
-        logger.warning("No patients to export")
-        return filepath
-
-    # Flatten for CSV — include latest risk level
-    rows = []
-    for p in patients:
-        latest = get_latest_assessment(p.get("patient_id", ""))
-        row = {
-            "patient_id":   p.get("patient_id"),
-            "name":         p.get("name"),
-            "age":          p.get("age"),
-            "sex":          p.get("sex"),
-            "created_at":   p.get("created_at"),
-            "risk_level":   latest.get("risk_level")   if latest else "N/A",
-            "confidence":   latest.get("confidence_pct") if latest else "N/A",
-            "ai_source":    latest.get("ai_source")    if latest else "N/A",
-        }
-        # Add clinical features
-        for feature in ["cp", "trestbps", "chol", "fbs", "restecg",
-                         "thalach", "exang", "oldpeak", "slope", "ca", "thal"]:
-            row[feature] = p.get(feature, "N/A")
-        rows.append(row)
-
-    fieldnames = list(rows[0].keys()) if rows else []
-
-    with open(filepath, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    logger.info("Exported %d patients to %s", len(rows), filepath)
-    return filepath
+    merged.to_csv(LOCAL_CSV_BACKUP_PATH, index=False)
+    logger.info("Exported backup to %s (%d rows)", LOCAL_CSV_BACKUP_PATH, len(merged))
+    return LOCAL_CSV_BACKUP_PATH
 
 
 # ─────────────────────────────────────────────
 # Module init
 # ─────────────────────────────────────────────
+
 try:
     init_db()
 except Exception as _exc:
-    logger.warning("Could not initialise local DB on import: %s", _exc)
+    logger.error("Failed to initialize database: %s", _exc)

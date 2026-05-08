@@ -1,102 +1,79 @@
-"""
-ai/prompt_builder.py
-────────────────────
-Structured prompt factory for AuraEcho+ cardiac AI.
+# =============================================================================
+# ai/prompt_builder.py
+# AuraEcho+ — Structured Prompt Factory for Cardiac AI
+#
+# Responsibility:
+#     Transform raw patient data, risk scores, and similar cases into
+#     carefully structured prompts that guide the LLM to produce
+#     clinically useful, formatted, and safe responses.
+#
+# Why a dedicated prompt builder?
+#     Both offline_ai.py (Ollama/Llama3) and online_ai.py (Groq/OpenAI)
+#     use IDENTICAL prompts — this file is the single source of truth.
+#
+# Public API:
+#     build_diagnosis_prompt(patient, risk_result, similar_cases) → PromptPackage
+#     build_followup_prompt(question, patient, history)           → PromptPackage
+#     build_summary_prompt(patient, risk_result)                  → PromptPackage
+#     build_alert_prompt(patient, risk_result, alert_reason)      → PromptPackage
+#     validate_prompt_package(pkg)                                → Tuple[bool, str]
+# =============================================================================
 
-Responsibility:
-    Transform raw patient data, risk scores, and similar cases into
-    carefully structured prompts that guide the LLM to produce
-    clinically useful, formatted, and safe responses.
-
-Why a dedicated prompt builder?
-    Both offline_ai.py (Ollama/Llama3) and online_ai.py (Groq/OpenAI)
-    use IDENTICAL prompts — this file is the single source of truth.
-    Changing the prompt format here updates both AI backends at once.
-
-Prompt anatomy:
-    ┌──────────────────────────────────────────────────────────┐
-    │  SYSTEM PROMPT  — sets the AI's role and constraints     │
-    ├──────────────────────────────────────────────────────────┤
-    │  USER PROMPT    — structured patient brief:              │
-    │    • Demographics + Vitals section                       │
-    │    • Risk Assessment section (from risk_model.py)        │
-    │    • Similar Cases section  (from similarity.py)         │
-    │    • Clinical Question section                           │
-    └──────────────────────────────────────────────────────────┘
-
-Public API:
-    build_diagnosis_prompt(patient, risk_result, similar_cases)
-        → PromptPackage (system_prompt, user_prompt, metadata)
-
-    build_followup_prompt(question, patient, conversation_history)
-        → PromptPackage
-
-    build_summary_prompt(patient, risk_result)
-        → PromptPackage  (short one-paragraph summary)
-"""
-
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils.constants import (
-    RISK_LOW, RISK_MEDIUM, RISK_HIGH,
-    FEATURE_COLUMNS,
     APP_NAME,
+    FEATURE_COLUMNS,
+    FEATURE_LABELS,
+    RISK_LEVELS,
+    RISK_LABELS,
+    RISK_COLORS,
+    RISK_ICONS,
+    CHEST_PAIN_LABELS,
+    THAL_LABELS,
+    SLOPE_LABELS,
+    RESTECG_LABELS,
+    LLM_MAX_TOKENS,
 )
-from utils.helpers import get_logger
+from utils.helpers import get_logger, normalize_risk_level, truncate
 
 logger = get_logger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-# Human-readable labels for every clinical feature
-# ─────────────────────────────────────────────────────────────
-_FEATURE_LABELS: Dict[str, str] = {
-    "age":      "Age (years)",
-    "sex":      "Sex",
-    "cp":       "Chest Pain Type",
-    "trestbps": "Resting Blood Pressure (mmHg)",
-    "chol":     "Serum Cholesterol (mg/dL)",
-    "fbs":      "Fasting Blood Sugar > 120 mg/dL",
-    "restecg":  "Resting ECG Result",
-    "thalach":  "Max Heart Rate Achieved (bpm)",
-    "exang":    "Exercise-Induced Angina",
-    "oldpeak":  "ST Depression (Exercise vs Rest)",
-    "slope":    "Slope of Peak ST Segment",
-    "ca":       "Number of Major Vessels (Fluoroscopy)",
-    "thal":     "Thalassemia Type",
-}
 
-# ─────────────────────────────────────────────────────────────
-# Categorical decode maps (numeric code → readable string)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Categorical decode map
+# FIXED: Built from constants — no duplication of decode maps.
+# ─────────────────────────────────────────────
+
 _DECODE: Dict[str, Dict[Any, str]] = {
-    "sex":     {0: "Female", 1: "Male"},
-    "cp":      {0: "Typical Angina", 1: "Atypical Angina",
-                2: "Non-Anginal Pain", 3: "Asymptomatic"},
+    "sex":     {0: "Female",          1: "Male"},
+    "cp":      CHEST_PAIN_LABELS,
     "fbs":     {0: "Normal (≤120 mg/dL)", 1: "High (>120 mg/dL)"},
-    "restecg": {0: "Normal", 1: "ST-T Wave Abnormality",
-                2: "Left Ventricular Hypertrophy"},
-    "exang":   {0: "No", 1: "Yes"},
-    "slope":   {0: "Upsloping", 1: "Flat", 2: "Downsloping"},
-    "thal":    {0: "Normal", 1: "Fixed Defect",
-                2: "Reversible Defect", 3: "Unknown"},
+    "restecg": RESTECG_LABELS,
+    "exang":   {0: "No",              1: "Yes"},
+    "slope":   SLOPE_LABELS,
+    "thal":    THAL_LABELS,
 }
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Risk-level framing used in prompts
-# ─────────────────────────────────────────────────────────────
+# Keys are "LOW" | "MEDIUM" | "HIGH" (consistent with RISK_LEVELS)
+# ─────────────────────────────────────────────
+
 _RISK_CONTEXT: Dict[str, str] = {
-    RISK_LOW: (
+    "LOW": (
         "The automated risk model classified this patient as LOW RISK. "
         "Focus your analysis on preventive care, lifestyle recommendations, "
         "and routine monitoring schedules."
     ),
-    RISK_MEDIUM: (
+    "MEDIUM": (
         "The automated risk model classified this patient as MEDIUM RISK. "
         "Focus your analysis on identifying which factors are driving risk, "
         "what diagnostic tests should be ordered next, and short-term management."
     ),
-    RISK_HIGH: (
+    "HIGH": (
         "The automated risk model classified this patient as HIGH RISK. "
         "This is an URGENT assessment. Focus on immediate intervention options, "
         "emergency referral criteria, and critical monitoring parameters."
@@ -104,9 +81,10 @@ _RISK_CONTEXT: Dict[str, str] = {
 }
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Result dataclass
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+
 @dataclass
 class PromptPackage:
     """
@@ -114,17 +92,17 @@ class PromptPackage:
 
     Attributes
     ----------
-    system_prompt   : str — the AI's role/persona instructions
-    user_prompt     : str — the actual patient query
-    prompt_type     : str — "diagnosis" | "followup" | "summary"
-    token_estimate  : int — rough token count (for model selection)
-    metadata        : dict — patient name, risk level, timestamp, etc.
+    system_prompt  : str  — AI role/persona instructions
+    user_prompt    : str  — actual patient query
+    prompt_type    : str  — "diagnosis" | "followup" | "summary" | "alert"
+    token_estimate : int  — rough token count
+    metadata       : dict — patient name, risk level, timestamp, etc.
     """
     system_prompt:  str
     user_prompt:    str
-    prompt_type:    str                     = "diagnosis"
-    token_estimate: int                     = 0
-    metadata:       Dict[str, Any]          = field(default_factory=dict)
+    prompt_type:    str                = "diagnosis"
+    token_estimate: int                = 0
+    metadata:       Dict[str, Any]     = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -136,13 +114,13 @@ class PromptPackage:
         }
 
     def full_prompt(self) -> str:
-        """Concatenate system + user prompt for models that use a single string."""
+        """Concatenate system + user prompt for single-string models."""
         return f"{self.system_prompt}\n\n{self.user_prompt}"
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Internal helpers
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 def _decode_feature(col: str, value: Any) -> str:
     """Convert a numeric feature value to a human-readable string."""
@@ -152,7 +130,6 @@ def _decode_feature(col: str, value: Any) -> str:
             return _DECODE[col].get(code, str(value))
         except (ValueError, TypeError):
             return str(value)
-    # Continuous feature — round and return as-is
     try:
         return str(round(float(value), 1))
     except (ValueError, TypeError):
@@ -163,40 +140,74 @@ def _format_patient_vitals(patient: Dict[str, Any]) -> str:
     """
     Build the vitals section of the prompt.
 
-    Returns a neatly formatted multi-line string, e.g.:
-        • Age (years)                : 55
-        • Sex                        : Male
-        • Chest Pain Type            : Typical Angina
-        ...
+    FIXED: Simplified format — no column alignment padding.
+           LLMs don't need monospace alignment.
     """
     lines = []
     for col in FEATURE_COLUMNS:
-        label = _FEATURE_LABELS.get(col, col)
-        value = patient.get(col, "N/A")
+        label    = FEATURE_LABELS.get(col, col)
+        value    = patient.get(col, "N/A")
         readable = _decode_feature(col, value)
-        lines.append(f"  • {label:<42}: {readable}")
+        lines.append(f"  • {label}: {readable}")
     return "\n".join(lines)
+
+
+def _normalize_risk_for_prompt(risk_result: Optional[Dict[str, Any]]) -> Tuple[str, str, str]:
+    """
+    ADDED: Central helper to extract and normalize risk level from risk_result.
+
+    FIXED: Handles both KEY ("HIGH") and LABEL ("High Risk") formats.
+           Uses normalize_risk_level() from helpers.py.
+
+    Returns
+    -------
+    (level_key, risk_label, risk_icon)
+        level_key  : "LOW" | "MEDIUM" | "HIGH"
+        risk_label : "Low Risk" | "Medium Risk" | "High Risk"
+        risk_icon  : "✅" | "⚠️" | "🚨"
+    """
+    if not risk_result or not isinstance(risk_result, dict):
+        return "MEDIUM", RISK_LABELS["MEDIUM"], RISK_ICONS["MEDIUM"]
+
+    raw_level = risk_result.get("risk_level", "MEDIUM")
+    level_key = normalize_risk_level(raw_level) or "MEDIUM"
+
+    # Validate key is in RISK_LEVELS
+    if level_key not in RISK_LEVELS:
+        level_key = "MEDIUM"
+
+    risk_label = RISK_LABELS.get(level_key, "Medium Risk")
+    risk_icon  = RISK_ICONS.get(level_key, "⚠️")
+
+    return level_key, risk_label, risk_icon
 
 
 def _format_risk_section(risk_result: Optional[Dict[str, Any]]) -> str:
     """
     Format the risk model output section.
 
-    risk_result is the .to_dict() of a RiskResult dataclass.
+    FIXED:
+    - Uses _normalize_risk_for_prompt() to handle key/label confusion.
+    - badge_icon and badge_color now derived from level_key directly
+      (no longer relies on missing keys in risk_result dict).
     """
     if not risk_result:
         return "  Risk assessment data not available."
 
-    level      = risk_result.get("risk_level", "Unknown")
-    confidence = risk_result.get("confidence_pct", 0)
-    prob       = risk_result.get("disease_prob", 0) * 100
-    factors    = risk_result.get("top_risk_factors", [])
-    explanation= risk_result.get("explanation", "")
+    level_key, risk_label, risk_icon = _normalize_risk_for_prompt(risk_result)
+
+    # FIXED: derive badge_color from level_key, not from risk_result dict
+    badge_color = RISK_COLORS.get(level_key, "#95a5a6")
+
+    confidence  = risk_result.get("confidence_pct", 0)
+    prob        = risk_result.get("disease_prob", 0) * 100
+    factors     = risk_result.get("top_risk_factors", [])
+    explanation = risk_result.get("explanation", "")
 
     factors_str = ", ".join(factors) if factors else "Not determined"
 
     return (
-        f"  Risk Level    : {level}\n"
+        f"  Risk Level    : {risk_icon} {risk_label} ({level_key})\n"
         f"  Confidence    : {confidence:.1f}%\n"
         f"  Disease Prob  : {prob:.1f}%\n"
         f"  Key Drivers   : {factors_str}\n"
@@ -204,10 +215,11 @@ def _format_risk_section(risk_result: Optional[Dict[str, Any]]) -> str:
     )
 
 
-def _format_similar_cases(similar_cases: Optional[List[Dict[str, Any]]]) -> str:
+def _format_similar_cases(
+    similar_cases: Optional[List[Dict[str, Any]]],
+) -> str:
     """
     Format the top-3 similar historical cases section.
-
     similar_cases is a list of SimilarCase.to_dict() results.
     """
     if not similar_cases:
@@ -215,15 +227,17 @@ def _format_similar_cases(similar_cases: Optional[List[Dict[str, Any]]]) -> str:
 
     lines = []
     for case in similar_cases[:3]:
-        rank    = case.get("rank", "?")
-        sim_pct = case.get("similarity_pct", 0)
-        age     = case.get("age", "?")
-        sex     = case.get("sex", "?")
-        outcome = case.get("outcome", "?")
-        risk    = case.get("risk_level", "?")
+        rank       = case.get("rank", "?")
+        sim_pct    = case.get("similarity_pct", 0)
+        age        = case.get("age", "?")
+        sex        = case.get("sex", "?")
+        outcome    = case.get("outcome", "?")
+        risk_key   = case.get("risk_level", "MEDIUM")
+        risk_label = RISK_LABELS.get(risk_key, risk_key)
+        risk_icon  = RISK_ICONS.get(risk_key, "❔")
         lines.append(
             f"  #{rank} ({sim_pct:.1f}% similar): "
-            f"{age}yr {sex} — Outcome: {outcome} — Risk: {risk}"
+            f"{age}yr {sex} — Outcome: {outcome} — {risk_icon} {risk_label}"
         )
 
     return "\n".join(lines)
@@ -231,17 +245,24 @@ def _format_similar_cases(similar_cases: Optional[List[Dict[str, Any]]]) -> str:
 
 def _estimate_tokens(text: str) -> int:
     """
-    Rough token estimate: ~4 characters per token (GPT-style tokenization).
+    Rough token estimate: ~4 characters per token (GPT-style).
     Used to warn if prompt is near model context limits.
     """
     return len(text) // 4
 
 
-def _build_system_prompt(risk_level: Optional[str] = None) -> str:
+def _build_system_prompt(risk_level_key: Optional[str] = None) -> str:
     """
-    Build the system prompt that sets the AI's role and constraints.
+    Build the system prompt that sets the AI role and constraints.
+
+    FIXED: Parameter renamed to risk_level_key for clarity.
+           Validates key against RISK_LEVELS before lookup.
     """
-    risk_context = _RISK_CONTEXT.get(risk_level or RISK_MEDIUM, "")
+    key = (risk_level_key or "MEDIUM").upper()
+    if key not in _RISK_CONTEXT:
+        key = "MEDIUM"
+
+    risk_context = _RISK_CONTEXT[key]
 
     return f"""You are a senior cardiologist AI assistant integrated into {APP_NAME}, \
 a clinical decision support system used by licensed medical professionals.
@@ -282,9 +303,9 @@ CONSTRAINTS:
 - Base all recommendations on the data provided, not assumptions"""
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Public API
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 def build_diagnosis_prompt(
     patient:       Dict[str, Any],
@@ -294,29 +315,38 @@ def build_diagnosis_prompt(
     """
     Build the primary diagnosis prompt package.
 
+    FIXED:
+    - Uses _normalize_risk_for_prompt() for safe key/label extraction.
+    - sex_code None safety added.
+    - _FEATURE_LABELS_DISPLAY removed — uses FEATURE_LABELS from constants.
+
     Parameters
     ----------
     patient       : raw patient dict (from UI form)
-    risk_result   : RiskResult.to_dict() from risk_model.py
-    similar_cases : list of SimilarCase.to_dict() from similarity.py
+    risk_result   : RiskResult.to_dict() from core.risk_model
+    similar_cases : list of SimilarCase.to_dict() from core.similarity
 
     Returns
     -------
-    PromptPackage — pass directly to offline_ai or online_ai
+    PromptPackage
     """
-    # Extract convenience fields
     patient_name = patient.get("name", "Unknown Patient")
     age          = patient.get("age", "?")
-    sex_code     = patient.get("sex", 1)
-    sex_label    = _DECODE["sex"].get(int(float(sex_code)), "Unknown")
-    risk_level   = risk_result.get("risk_level") if risk_result else None
 
-    # Build sections
+    # FIXED: Safe sex_code extraction with None guard
+    sex_code = patient.get("sex", 1)
+    try:
+        sex_label = _DECODE["sex"].get(int(float(sex_code)), "Unknown")
+    except (TypeError, ValueError):
+        sex_label = "Unknown"
+
+    # FIXED: normalize risk level using central helper
+    level_key, risk_label, risk_icon = _normalize_risk_for_prompt(risk_result)
+
     vitals_section  = _format_patient_vitals(patient)
     risk_section    = _format_risk_section(risk_result)
     similar_section = _format_similar_cases(similar_cases)
 
-    # Compose user prompt
     user_prompt = f"""
 ═══════════════════════════════════════════════════════════
 CARDIAC PATIENT ASSESSMENT REQUEST
@@ -352,12 +382,12 @@ Please follow the structured output format specified in your instructions.
 ═══════════════════════════════════════════════════════════
 """.strip()
 
-    system_prompt = _build_system_prompt(risk_level)
+    system_prompt  = _build_system_prompt(level_key)
     token_estimate = _estimate_tokens(system_prompt + user_prompt)
 
     logger.info(
         "Built diagnosis prompt for '%s' | risk=%s | ~%d tokens",
-        patient_name, risk_level, token_estimate,
+        patient_name, level_key, token_estimate,
     )
 
     return PromptPackage(
@@ -367,11 +397,13 @@ Please follow the structured output format specified in your instructions.
         token_estimate=token_estimate,
         metadata={
             "patient_name": patient_name,
-            "risk_level":   risk_level,
+            "risk_level":   level_key,
+            "risk_label":   risk_label,
             "age":          age,
             "sex":          sex_label,
             "has_similar":  bool(similar_cases),
             "has_risk":     bool(risk_result),
+            "app_name":     APP_NAME,
         },
     )
 
@@ -384,10 +416,13 @@ def build_followup_prompt(
     """
     Build a follow-up question prompt (conversational mode).
 
+    FIXED: Uses helpers.truncate() for clean word-boundary truncation
+           instead of raw [:300] slice.
+
     Parameters
     ----------
     question             : doctor/nurse's follow-up question
-    patient              : current patient dict (for context)
+    patient              : current patient dict
     conversation_history : list of {"role": "user"|"assistant", "content": str}
 
     Returns
@@ -397,13 +432,15 @@ def build_followup_prompt(
     patient_name = patient.get("name", "the patient")
     age          = patient.get("age", "?")
 
-    # Summarise conversation history
     history_text = ""
     if conversation_history:
         history_lines = []
-        for turn in conversation_history[-6:]:   # last 3 Q&A pairs
+        # Keep last 6 turns (3 Q&A pairs)
+        recent = conversation_history[-6:]
+        for turn in recent:
             role    = "Doctor" if turn.get("role") == "user" else "AI"
-            content = turn.get("content", "")[:300]   # truncate long turns
+            # FIXED: uses truncate() for clean word-boundary truncation
+            content = truncate(turn.get("content", ""), max_len=300)
             history_lines.append(f"{role}: {content}")
         history_text = "\n".join(history_lines)
 
@@ -422,17 +459,24 @@ Please answer concisely and specifically, referencing the patient's
 clinical data where relevant. Use the same structured format as before.
 """.strip()
 
-    system_prompt = _build_system_prompt()
+    system_prompt  = _build_system_prompt()
     token_estimate = _estimate_tokens(system_prompt + user_prompt)
 
-    logger.info("Built followup prompt | ~%d tokens", token_estimate)
+    logger.info(
+        "Built followup prompt for '%s' | ~%d tokens",
+        patient_name, token_estimate,
+    )
 
     return PromptPackage(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         prompt_type="followup",
         token_estimate=token_estimate,
-        metadata={"patient_name": patient_name, "question": question[:100]},
+        metadata={
+            "patient_name": patient_name,
+            "question":     truncate(question, max_len=100),
+            "app_name":     APP_NAME,
+        },
     )
 
 
@@ -443,16 +487,24 @@ def build_summary_prompt(
     """
     Build a short one-paragraph summary prompt.
 
-    Used for the dashboard summary card — brief, plain-language,
-    non-technical summary for nurses or for patient-facing displays.
+    FIXED: Uses _normalize_risk_for_prompt() for consistent risk extraction.
+
+    Used for dashboard summary card — brief, plain-language,
+    non-technical summary for nurses or patient-facing displays.
 
     Returns
     -------
-    PromptPackage  (token_estimate will be ~200–400)
+    PromptPackage  (token_estimate ~200–400)
     """
     patient_name = patient.get("name", "the patient")
-    risk_level   = risk_result.get("risk_level", "Unknown") if risk_result else "Unknown"
-    confidence   = risk_result.get("confidence_pct", 0) if risk_result else 0
+
+    # FIXED: central risk normalization
+    level_key, risk_label, risk_icon = _normalize_risk_for_prompt(risk_result)
+    confidence = (
+        risk_result.get("confidence_pct", 0.0)
+        if risk_result and isinstance(risk_result, dict)
+        else 0.0
+    )
 
     vitals_section = _format_patient_vitals(patient)
 
@@ -462,7 +514,7 @@ Use simple language suitable for a non-specialist nurse or patient educator.
 Do NOT use medical jargon. State the risk level and the 2 most important action items.
 
 PATIENT: {patient_name}
-RISK LEVEL: {risk_level} (confidence: {confidence:.1f}%)
+RISK LEVEL: {risk_icon} {risk_label} ({level_key}) — confidence: {confidence:.1f}%
 VITALS:
 {vitals_section}
 """.strip()
@@ -480,5 +532,114 @@ VITALS:
         user_prompt=user_prompt,
         prompt_type="summary",
         token_estimate=token_estimate,
-        metadata={"patient_name": patient_name, "risk_level": risk_level},
+        metadata={
+            "patient_name": patient_name,
+            "risk_level":   level_key,
+            "risk_label":   risk_label,
+            "app_name":     APP_NAME,
+        },
     )
+
+
+def build_alert_prompt(
+    patient:      Dict[str, Any],
+    risk_result:  Optional[Dict[str, Any]] = None,
+    alert_reason: str = "",
+) -> PromptPackage:
+    """
+    ADDED: Build an urgent alert prompt for HIGH risk patients.
+    Produces a triage-focused, concise output for emergency use.
+    Used by ui/results_panel.py when risk_level == HIGH.
+
+    Parameters
+    ----------
+    patient      : raw patient dict
+    risk_result  : RiskResult.to_dict()
+    alert_reason : reason for the alert (optional)
+
+    Returns
+    -------
+    PromptPackage
+    """
+    patient_name = patient.get("name", "Unknown Patient")
+    vitals       = _format_patient_vitals(patient)
+    risk_section = _format_risk_section(risk_result)
+
+    system_prompt = (
+        "You are an emergency cardiology triage AI. "
+        "Provide URGENT, concise clinical guidance. "
+        "Focus only on immediate life-saving actions. "
+        "Flag any STEMI/ACS criteria immediately with 🚨."
+    )
+
+    user_prompt = f"""
+🚨 URGENT HIGH-RISK CARDIAC ALERT 🚨
+
+PATIENT: {patient_name}
+ALERT REASON: {alert_reason or "High cardiac risk score detected"}
+
+VITALS:
+{vitals}
+
+RISK ASSESSMENT:
+{risk_section}
+
+Provide:
+1. IMMEDIATE actions (next 30 minutes)
+2. Emergency referral criteria met (yes/no + reason)
+3. Critical monitoring parameters
+4. Red flag symptoms to watch for NOW
+
+Keep response under 200 words. Be direct and actionable.
+""".strip()
+
+    token_estimate = _estimate_tokens(system_prompt + user_prompt)
+
+    logger.info(
+        "Built alert prompt for '%s' | reason=%s | ~%d tokens",
+        patient_name,
+        truncate(alert_reason, max_len=50) if alert_reason else "N/A",
+        token_estimate,
+    )
+
+    return PromptPackage(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        prompt_type="alert",
+        token_estimate=token_estimate,
+        metadata={
+            "patient_name": patient_name,
+            "alert_reason": alert_reason,
+            "app_name":     APP_NAME,
+        },
+    )
+
+
+def validate_prompt_package(pkg: PromptPackage) -> Tuple[bool, str]:
+    """
+    ADDED: Validate a PromptPackage before sending to LLM.
+
+    Checks:
+    - Prompts are non-empty
+    - Token count is within model limits
+    - prompt_type is valid
+
+    Returns
+    -------
+    (is_valid: bool, warning_message: str)
+    """
+    valid_types = {"diagnosis", "followup", "summary", "alert"}
+
+    if not pkg.system_prompt.strip():
+        return False, "System prompt is empty."
+    if not pkg.user_prompt.strip():
+        return False, "User prompt is empty."
+    if pkg.prompt_type not in valid_types:
+        return False, f"Invalid prompt_type '{pkg.prompt_type}'. Must be one of {valid_types}."
+    if pkg.token_estimate > LLM_MAX_TOKENS:
+        return False, (
+            f"Prompt too long: ~{pkg.token_estimate} tokens "
+            f"(max: {LLM_MAX_TOKENS}). "
+            f"Consider reducing similar cases or conversation history."
+        )
+    return True, ""

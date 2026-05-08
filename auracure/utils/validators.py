@@ -5,8 +5,9 @@
 # All functions return (is_valid: bool, error_message: str).
 # =============================================================================
 
+import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from utils.constants import (
     FEATURE_COLUMNS,
@@ -16,6 +17,8 @@ from utils.constants import (
     NUMERICAL_FEATURES,
     PASSWORD_MIN_LENGTH,
     FEATURE_LABELS,
+    ROLES,
+    MAX_LOGIN_ATTEMPTS,
 )
 from utils.helpers import get_logger, is_numeric
 
@@ -68,7 +71,81 @@ def in_allowed(value: Any, allowed: List) -> bool:
 
 
 # =============================================================================
-# PER-FEATURE VALIDATORS
+# PATIENT DEMOGRAPHIC VALIDATORS
+# =============================================================================
+
+def validate_patient_name(name: Any) -> ValidationResult:
+    """
+    Validate patient name (required for UI display, not for ML model).
+    """
+    if not is_non_empty(name):
+        return False, "Patient name is required."
+
+    name_str = str(name).strip()
+    if len(name_str) < 2:
+        return False, "Name must be at least 2 characters."
+    if len(name_str) > 100:
+        return False, "Name must be less than 100 characters."
+    if not re.match(r"^[a-zA-Z\s\-\.']+$", name_str):
+        return False, "Name contains invalid characters."
+    return True, ""
+
+
+def validate_symptoms(symptoms: Any) -> ValidationResult:
+    """
+    Validate symptoms description (free text field in UI).
+    Optional field — empty is allowed.
+    """
+    if not is_non_empty(symptoms):
+        return True, ""   # Optional field
+
+    symptoms_str = str(symptoms).strip()
+    if len(symptoms_str) > 2000:
+        return False, "Symptoms description must be less than 2000 characters."
+    return True, ""
+
+
+def validate_medical_report(file_obj: Any) -> ValidationResult:
+    """
+    Validate uploaded medical report file.
+    Supports PDF, JPG, PNG, DICOM formats.
+    Optional field — None is allowed.
+    """
+    if file_obj is None:
+        return True, ""   # Optional field
+
+    # Handle Streamlit UploadedFile
+    if hasattr(file_obj, "name"):
+        filename = file_obj.name
+        size = getattr(file_obj, "size", None)
+        if size is None:
+            try:
+                size = os.path.getsize(str(file_obj))
+            except OSError:
+                return False, "Cannot determine file size."
+    else:
+        filename = str(file_obj)
+        try:
+            size = os.path.getsize(filename)
+        except OSError:
+            return False, "Cannot access uploaded file."
+
+    # Check extension
+    allowed_exts = {".pdf", ".jpg", ".jpeg", ".png", ".dcm", ".dicom"}
+    ext = os.path.splitext(filename.lower())[1]
+    if ext not in allowed_exts:
+        return False, f"Invalid file type. Allowed: {', '.join(sorted(allowed_exts))}"
+
+    # Check size (max 10 MB)
+    max_size = 10 * 1024 * 1024
+    if size > max_size:
+        return False, "File size must be less than 10 MB."
+
+    return True, ""
+
+
+# =============================================================================
+# PER-FEATURE VALIDATORS (Clinical Features)
 # =============================================================================
 
 def validate_age(value: Any) -> ValidationResult:
@@ -100,11 +177,15 @@ def validate_chest_pain(value: Any) -> ValidationResult:
 
 
 def validate_resting_bp(value: Any) -> ValidationResult:
+    """
+    FIXED: Resting BP is always a whole number clinically.
+    Changed float check → int check.
+    """
     if not is_non_empty(value):
         return False, "Resting blood pressure is required."
-    if not is_float_like(value):
-        return False, "Resting blood pressure must be a number."
-    bp = float(str(value))
+    if not is_int_like(value):
+        return False, "Resting blood pressure must be a whole number."
+    bp = int(float(str(value)))
     lo, hi = FEATURE_RANGES["trestbps"]
     if not in_range(bp, lo, hi):
         return False, f"Resting BP must be between {lo} and {hi} mm Hg."
@@ -112,11 +193,15 @@ def validate_resting_bp(value: Any) -> ValidationResult:
 
 
 def validate_cholesterol(value: Any) -> ValidationResult:
+    """
+    FIXED: Cholesterol is always a whole number (mg/dl) clinically.
+    Changed float check → int check.
+    """
     if not is_non_empty(value):
         return False, "Cholesterol is required."
-    if not is_float_like(value):
-        return False, "Cholesterol must be a number."
-    chol = float(str(value))
+    if not is_int_like(value):
+        return False, "Cholesterol must be a whole number."
+    chol = int(float(str(value)))
     lo, hi = FEATURE_RANGES["chol"]
     if not in_range(chol, lo, hi):
         return False, f"Cholesterol must be between {lo} and {hi} mg/dl."
@@ -140,11 +225,15 @@ def validate_restecg(value: Any) -> ValidationResult:
 
 
 def validate_max_hr(value: Any) -> ValidationResult:
+    """
+    FIXED: Max heart rate is always a whole number clinically.
+    Changed float check → int check.
+    """
     if not is_non_empty(value):
         return False, "Maximum heart rate is required."
-    if not is_float_like(value):
-        return False, "Maximum heart rate must be a number."
-    hr = float(str(value))
+    if not is_int_like(value):
+        return False, "Maximum heart rate must be a whole number."
+    hr = int(float(str(value)))
     lo, hi = FEATURE_RANGES["thalach"]
     if not in_range(hr, lo, hi):
         return False, f"Max heart rate must be between {lo} and {hi} bpm."
@@ -199,7 +288,7 @@ def validate_thal(value: Any) -> ValidationResult:
 # FIELD → VALIDATOR DISPATCH TABLE
 # =============================================================================
 
-_FIELD_VALIDATORS = {
+_FIELD_VALIDATORS: Dict[str, Any] = {
     "age":      validate_age,
     "sex":      validate_sex,
     "cp":       validate_chest_pain,
@@ -220,29 +309,36 @@ _FIELD_VALIDATORS = {
 # PATIENT DICT VALIDATOR (main entry point)
 # =============================================================================
 
-def validate_patient(patient: Dict[str, Any]) -> Tuple[bool, Dict[str, str]]:
+def validate_patient(
+    patient: Dict[str, Any],
+    check_structure: bool = False,       # ADDED: structure check for similarity.py
+) -> Tuple[bool, Dict[str, str]]:
     """
     Validate a full patient feature dictionary.
 
     Args:
-        patient: dict mapping feature names to raw input values.
+        patient         : dict mapping feature names to raw input values.
+        check_structure : if True, also checks that all required keys exist.
 
     Returns:
         (all_valid: bool, errors: Dict[field_key → error_message])
-
-    Example:
-        patient = {"age": 54, "sex": 1, "cp": 2, ...}
-        ok, errors = validate_patient(patient)
-        if not ok:
-            for field, msg in errors.items():
-                print(f"{field}: {msg}")
     """
     errors: Dict[str, str] = {}
+
+    # ADDED: Structure check — all required keys present
+    if check_structure:
+        missing_keys = set(FEATURE_COLUMNS) - set(patient.keys())
+        if missing_keys:
+            for k in sorted(missing_keys):
+                errors[k] = f"Required field '{k}' is missing."
+            return False, errors
 
     for field in FEATURE_COLUMNS:
         validator = _FIELD_VALIDATORS.get(field)
         if validator is None:
-            logger.warning("validate_patient: no validator for field '%s'", field)
+            logger.warning(
+                "validate_patient: no validator for field '%s'", field
+            )
             continue
 
         value = patient.get(field)
@@ -253,7 +349,10 @@ def validate_patient(patient: Dict[str, Any]) -> Tuple[bool, Dict[str, str]]:
     all_valid = len(errors) == 0
 
     if not all_valid:
-        logger.debug("validate_patient: %d field error(s) — %s", len(errors), list(errors.keys()))
+        logger.debug(
+            "validate_patient: %d field error(s) — %s",
+            len(errors), list(errors.keys()),
+        )
 
     return all_valid, errors
 
@@ -262,9 +361,6 @@ def validate_single_field(field: str, value: Any) -> ValidationResult:
     """
     Validate a single patient field by name.
     Useful for real-time form validation in the Streamlit sidebar.
-
-    Returns:
-        (is_valid: bool, error_message: str)
     """
     validator = _FIELD_VALIDATORS.get(field)
     if validator is None:
@@ -292,6 +388,7 @@ def validate_password(password: str) -> ValidationResult:
     - Minimum length (from constants)
     - At least one uppercase letter
     - At least one digit
+    - ADDED: At least one special character (clinical security standard)
     """
     if not is_non_empty(password):
         return False, "Password is required."
@@ -301,6 +398,10 @@ def validate_password(password: str) -> ValidationResult:
         return False, "Password must contain at least one uppercase letter."
     if not any(c.isdigit() for c in password):
         return False, "Password must contain at least one digit."
+    # ADDED: special character requirement
+    special_chars = set("!@#$%^&*()_+-=[]{}|;':\",./<>?")
+    if not any(c in special_chars for c in password):
+        return False, "Password must contain at least one special character."
     return True, ""
 
 
@@ -316,6 +417,49 @@ def validate_username(username: str) -> ValidationResult:
     return True, ""
 
 
+def validate_role(role: Any) -> ValidationResult:
+    """
+    Validate role selection against allowed roles from constants.
+    """
+    if not is_non_empty(role):
+        return False, "Role is required."
+
+    role_str = str(role).strip().lower()
+    valid_roles = [r.lower() for r in ROLES.values()]
+
+    if role_str not in valid_roles:
+        return False, f"Invalid role. Must be one of: {', '.join(valid_roles)}."
+    return True, ""
+
+
+def validate_login_attempt(attempts: int) -> ValidationResult:
+    """
+    ADDED: Check if login attempts exceed the maximum allowed.
+    Used by services/auth_service.py.
+    """
+    if attempts >= MAX_LOGIN_ATTEMPTS:
+        return False, (
+            f"Account locked after {MAX_LOGIN_ATTEMPTS} failed attempts. "
+            f"Please try again later."
+        )
+    return True, ""
+
+
+def validate_api_key(key: str, provider: str = "API") -> ValidationResult:
+    """
+    ADDED: Basic API key format validation.
+    Used by services and UI system status checks.
+    """
+    if not is_non_empty(key):
+        return False, f"{provider} API key is required."
+    key = key.strip()
+    if len(key) < 20:
+        return False, f"{provider} API key appears too short."
+    if " " in key:
+        return False, f"{provider} API key must not contain spaces."
+    return True, ""
+
+
 # =============================================================================
 # DATA FILE VALIDATORS
 # =============================================================================
@@ -323,7 +467,6 @@ def validate_username(username: str) -> ValidationResult:
 def validate_csv_columns(df_columns: List[str]) -> ValidationResult:
     """
     Check that a loaded DataFrame contains all required feature columns.
-    Used when loading heart_data.csv to catch malformed files early.
     """
     required = set(FEATURE_COLUMNS + ["target"])
     present  = set(df_columns)
@@ -332,7 +475,6 @@ def validate_csv_columns(df_columns: List[str]) -> ValidationResult:
     if missing:
         missing_labels = [FEATURE_LABELS.get(c, c) for c in sorted(missing)]
         return False, f"CSV is missing required columns: {', '.join(missing_labels)}"
-
     return True, ""
 
 
@@ -343,26 +485,25 @@ def validate_sample_input(data: Dict[str, Any]) -> Tuple[bool, Dict[str, str]]:
     """
     if not isinstance(data, dict):
         return False, {"_": "Sample input must be a JSON object (dict)."}
-
     return validate_patient(data)
 
 
 # =============================================================================
-# BATCH VALIDATOR (for syncing offline records)
+# BATCH VALIDATOR
 # =============================================================================
 
 def validate_batch(
     records: List[Dict[str, Any]],
-) -> Tuple[List[Dict], List[Tuple[int, Dict[str, str]]]]:
+) -> Tuple[List[Dict[str, Any]], List[Tuple[int, Dict[str, str]]]]:
     """
     Validate a list of patient records.
 
     Returns:
-        valid_records:   list of records that passed validation
-        invalid_records: list of (index, errors) tuples for failed records
+        valid_records   : list of records that passed validation
+        invalid_records : list of (index, errors) for failed records
     """
-    valid: List[Dict] = []
-    invalid: List[Tuple[int, Dict[str, str]]] = []
+    valid:   List[Dict[str, Any]]               = []
+    invalid: List[Tuple[int, Dict[str, str]]]   = []
 
     for i, record in enumerate(records):
         ok, errors = validate_patient(record)
@@ -386,9 +527,25 @@ def errors_to_str(errors: Dict[str, str]) -> str:
     """
     Flatten a field-error dict into a single readable string.
 
+    FIXED: Handles '_' generic error key cleanly (no ugly underscore shown).
+
     Example:
-        {"age": "Age must be positive", "chol": "Cholesterol out of range"}
-        → "• age: Age must be positive\n• chol: Cholesterol out of range"
+        {"age": "Age must be positive", "_": "Generic error"}
+        → "• Age (years): Age must be positive\\n• Generic error"
     """
-    lines = [f"• {FEATURE_LABELS.get(k, k)}: {v}" for k, v in errors.items()]
+    lines = []
+    for k, v in errors.items():
+        if k == "_":
+            lines.append(f"• {v}")
+        else:
+            label = FEATURE_LABELS.get(k, k)
+            lines.append(f"• {label}: {v}")
     return "\n".join(lines)
+
+
+def format_validation_errors(errors: Dict[str, str]) -> str:
+    """
+    ADDED: Alias for errors_to_str().
+    Used by core/similarity.py which imports this name directly.
+    """
+    return errors_to_str(errors)

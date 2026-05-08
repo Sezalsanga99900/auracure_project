@@ -1,310 +1,77 @@
-"""
-services/auth_service.py
-────────────────────────
-Authentication and role-based access control for AuraEcho+.
+# =============================================================================
+# services/auth_service.py
+# AuraEcho+ — Authentication & Authorization Service
+#
+# Responsibility:
+#     Manage user authentication, role-based access control, session management,
+#     and account lockout policies. Uses a separate SQLite database for auth.
+#
+# Security Features:
+#     • bcrypt password hashing with salt
+#     • Account lockout after MAX_LOGIN_ATTEMPTS
+#     • Session expiry after SESSION_TTL_HOURS
+#     • Role-based permission checks
+#     • Secure session tokens
+#
+# Public API:
+#     init_auth_db()                    → None
+#     create_user(username, password, role) → bool
+#     authenticate(username, password)  → dict | None
+#     check_permission(role, permission) → bool
+#     get_user(username)                → dict | None
+#     update_user_role(username, role)  → bool
+#     delete_user(username)             → bool
+#     list_users()                      → list[dict]
+#     create_session(user)              → str (session_token)
+#     validate_session(token)           → dict | None
+#     clear_session(token)              → None
+#     create_default_admin()            → bool
+# =============================================================================
 
-Responsibility:
-    Handle user registration, login, session management, and
-    permission checking for the two clinical roles:
-        • Doctor  — full access (diagnosis, AI, analytics, export)
-        • Nurse   — restricted access (view records, vitals entry only)
-
-Architecture:
-    ┌─────────────────────────────────────────────────────────┐
-    │  Users stored in SQLite (auth.db) — separate from       │
-    │  patient data for security isolation                    │
-    │                                                         │
-    │  Passwords hashed with bcrypt (never stored plain-text) │
-    │                                                         │
-    │  Sessions stored in Streamlit session_state + SQLite    │
-    │  (survives page refresh, expires after SESSION_TTL)     │
-    └─────────────────────────────────────────────────────────┘
-
-Role permissions matrix:
-    Permission              Doctor    Nurse
-    ──────────────────────────────────────
-    view_patient_data         ✅        ✅
-    enter_vitals              ✅        ✅
-    run_ai_diagnosis          ✅        ❌
-    view_ai_results           ✅        ❌
-    view_risk_scores          ✅        ✅
-    export_data               ✅        ❌
-    view_analytics            ✅        ✅
-    manage_users              ✅        ❌
-    delete_patient            ✅        ❌
-    view_similar_cases        ✅        ✅
-
-Public API:
-    register_user(username, password, role, email) → bool
-    login(username, password)                      → SessionToken | None
-    logout(token)                                  → None
-    get_current_user(token)                        → UserRecord | None
-    has_permission(token, permission)              → bool
-    require_permission(token, permission)          → None (raises if denied)
-    get_all_users()                                → List[UserRecord]
-    change_password(token, old_pw, new_pw)         → bool
-    delete_user(admin_token, username)             → bool
-    is_authenticated(token)                        → bool
-"""
-
-import hashlib
 import os
-import secrets
 import sqlite3
-import uuid
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+import threading
+import secrets
+import hashlib
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+try:
+    import bcrypt
+    BCRYPT_AVAILABLE = True
+except ImportError:
+    BCRYPT_AVAILABLE = False
 
 from utils.constants import (
     AUTH_DB_PATH,
-    ROLE_DOCTOR,
-    ROLE_NURSE,
-    SESSION_TTL_HOURS,
     ROLES,
     ROLE_PERMISSIONS,
+    ROLE_DOCTOR,
+    ROLE_NURSE,
+    ROLE_ADMIN,
+    SESSION_TTL_HOURS,
+    PASSWORD_MIN_LENGTH,
+    MAX_LOGIN_ATTEMPTS,
+    LOCKOUT_DURATION_MIN,
+    JWT_ALGORITHM,
 )
-from utils.helpers import get_logger
-from utils.validators import validate_username, validate_password, validate_email
+from utils.helpers import get_logger, ensure_dir, now_str, mask_key
+from utils.validators import (
+    validate_username,
+    validate_password,
+    validate_role,
+    validate_login_attempt,
+)
 
 logger = get_logger(__name__)
 
-# ─────────────────────────────────────────────
-# Try bcrypt, fall back to sha256 if not installed
-# ─────────────────────────────────────────────
-try:
-    import bcrypt
-    _USE_BCRYPT = True
-    logger.info("bcrypt available — using for password hashing")
-except ImportError:
-    _USE_BCRYPT = False
-    logger.warning(
-        "bcrypt not installed — using SHA-256 fallback. "
-        "Install bcrypt for production: pip install bcrypt"
-    )
+# Thread lock for database operations
+_db_lock = threading.Lock()
 
-
-# ─────────────────────────────────────────────
-# Data classes
-# ─────────────────────────────────────────────
-
-@dataclass
-class UserRecord:
-    """
-    A single registered user in the system.
-
-    Attributes
-    ----------
-    user_id    : str   UUID
-    username   : str
-    email      : str
-    role       : str   "doctor" | "nurse"
-    created_at : str   ISO-8601
-    last_login : str   ISO-8601 or ""
-    is_active  : bool
-    """
-    user_id:    str
-    username:   str
-    email:      str
-    role:       str
-    created_at: str
-    last_login: str  = ""
-    is_active:  bool = True
-
-    @property
-    def is_doctor(self) -> bool:
-        return self.role == ROLE_DOCTOR
-
-    @property
-    def is_nurse(self) -> bool:
-        return self.role == ROLE_NURSE
-
-    @property
-    def display_name(self) -> str:
-        role_label = "Dr." if self.is_doctor else "Nurse"
-        return f"{role_label} {self.username.title()}"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "user_id":    self.user_id,
-            "username":   self.username,
-            "email":      self.email,
-            "role":       self.role,
-            "created_at": self.created_at,
-            "last_login": self.last_login,
-            "is_active":  self.is_active,
-        }
-
-
-@dataclass
-class SessionToken:
-    """
-    An active user session.
-
-    Attributes
-    ----------
-    token      : str   — cryptographically random hex string
-    user_id    : str   — UUID of the authenticated user
-    username   : str
-    role       : str
-    created_at : datetime
-    expires_at : datetime
-    """
-    token:      str
-    user_id:    str
-    username:   str
-    role:       str
-    created_at: datetime
-    expires_at: datetime
-
-    @property
-    def is_expired(self) -> bool:
-        return datetime.now(timezone.utc) >= self.expires_at
-
-    @property
-    def is_valid(self) -> bool:
-        return not self.is_expired
-
-    @property
-    def ttl_minutes(self) -> int:
-        """Minutes remaining before expiry."""
-        remaining = self.expires_at - datetime.now(timezone.utc)
-        return max(0, int(remaining.total_seconds() / 60))
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "token":      self.token,
-            "user_id":    self.user_id,
-            "username":   self.username,
-            "role":       self.role,
-            "created_at": self.created_at.isoformat(),
-            "expires_at": self.expires_at.isoformat(),
-            "ttl_minutes": self.ttl_minutes,
-        }
-
-
-# ─────────────────────────────────────────────
-# Schema
-# ─────────────────────────────────────────────
-
-_CREATE_USERS_TABLE = """
-CREATE TABLE IF NOT EXISTS users (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id      TEXT    NOT NULL UNIQUE,
-    username     TEXT    NOT NULL UNIQUE COLLATE NOCASE,
-    email        TEXT    NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT   NOT NULL,
-    role         TEXT    NOT NULL DEFAULT 'nurse',
-    created_at   TEXT    NOT NULL,
-    last_login   TEXT    NOT NULL DEFAULT '',
-    is_active    INTEGER NOT NULL DEFAULT 1
-);
-"""
-
-_CREATE_SESSIONS_TABLE = """
-CREATE TABLE IF NOT EXISTS sessions (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    token      TEXT    NOT NULL UNIQUE,
-    user_id    TEXT    NOT NULL,
-    created_at TEXT    NOT NULL,
-    expires_at TEXT    NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
-"""
-
-_CREATE_AUTH_INDEXES = [
-    "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);",
-    "CREATE INDEX IF NOT EXISTS idx_sessions_user  ON sessions(user_id);",
-]
-
-
-# ─────────────────────────────────────────────
-# DB connection
-# ─────────────────────────────────────────────
-
-def _ensure_auth_dir() -> None:
-    Path(AUTH_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-
-
-@contextmanager
-def _get_conn() -> Generator[sqlite3.Connection, None, None]:
-    _ensure_auth_dir()
-    conn = sqlite3.connect(AUTH_DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    try:
-        yield conn
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def init_auth_db() -> None:
-    """
-    Create auth tables and seed a default admin doctor account if empty.
-    Safe to call multiple times.
-    """
-    _ensure_auth_dir()
-    with _get_conn() as conn:
-        conn.execute(_CREATE_USERS_TABLE)
-        conn.execute(_CREATE_SESSIONS_TABLE)
-        for idx in _CREATE_AUTH_INDEXES:
-            conn.execute(idx)
-        conn.commit()
-
-    # Seed default doctor account if no users exist
-    with _get_conn() as conn:
-        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-
-    if count == 0:
-        logger.info("No users found — seeding default admin doctor account")
-        _seed_default_users()
-
-    logger.info("Auth database initialised at %s", AUTH_DB_PATH)
-
-
-def _seed_default_users() -> None:
-    """
-    Create default demo accounts for development/hackathon demo.
-
-    Default credentials:
-        Doctor: username=admin_doctor  password=Doctor@123
-        Nurse:  username=nurse_demo    password=Nurse@123
-
-    ⚠️  Change these immediately in production!
-    """
-    default_users = [
-        {
-            "username": "admin_doctor",
-            "password": "Doctor@123",
-            "role":     ROLE_DOCTOR,
-            "email":    "doctor@auraecho.demo",
-        },
-        {
-            "username": "nurse_demo",
-            "password": "Nurse@123",
-            "role":     ROLE_NURSE,
-            "email":    "nurse@auraecho.demo",
-        },
-    ]
-    for u in default_users:
-        try:
-            register_user(
-                username=u["username"],
-                password=u["password"],
-                role=u["role"],
-                email=u["email"],
-                skip_validation=True,   # bypass strict validators for seed data
-            )
-            logger.info("Seeded user: %s (%s)", u["username"], u["role"])
-        except Exception as exc:
-            logger.warning("Could not seed user %s: %s", u["username"], exc)
+# In-memory session store (for Streamlit compatibility)
+# In production, consider Redis or database-backed sessions
+_sessions: Dict[str, Dict[str, Any]] = {}
+_sessions_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────────
@@ -313,511 +80,647 @@ def _seed_default_users() -> None:
 
 def _hash_password(password: str) -> str:
     """
-    Hash a plain-text password for storage.
-
-    Uses bcrypt if available (preferred), otherwise SHA-256 + salt.
+    Hash password using bcrypt (preferred) or PBKDF2 fallback.
+    Returns hashed password string.
     """
-    if _USE_BCRYPT:
+    if BCRYPT_AVAILABLE:
         salt = bcrypt.gensalt(rounds=12)
-        return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+        hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
+        return hashed.decode("utf-8")
     else:
-        # SHA-256 + random salt (fallback)
-        salt = secrets.token_hex(32)
-        hashed = hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
-        return f"sha256:{salt}:{hashed}"
-
-
-def _verify_password(plain: str, stored_hash: str) -> bool:
-    """
-    Verify a plain-text password against a stored hash.
-    Handles both bcrypt and SHA-256 formats.
-    """
-    if stored_hash.startswith("sha256:"):
-        _, salt, expected_hash = stored_hash.split(":", 2)
-        actual = hashlib.sha256(f"{salt}{plain}".encode()).hexdigest()
-        return secrets.compare_digest(actual, expected_hash)
-    elif _USE_BCRYPT:
-        try:
-            return bcrypt.checkpw(plain.encode("utf-8"), stored_hash.encode("utf-8"))
-        except Exception:
-            return False
-    return False
-
-
-# ─────────────────────────────────────────────
-# Internal helpers
-# ─────────────────────────────────────────────
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _row_to_user(row: sqlite3.Row) -> UserRecord:
-    d = dict(row)
-    return UserRecord(
-        user_id=d["user_id"],
-        username=d["username"],
-        email=d["email"],
-        role=d["role"],
-        created_at=d["created_at"],
-        last_login=d.get("last_login", ""),
-        is_active=bool(d.get("is_active", 1)),
-    )
-
-
-def _generate_token() -> str:
-    """Generate a cryptographically secure 64-character session token."""
-    return secrets.token_hex(32)   # 32 bytes = 64 hex chars
-
-
-def _store_session(token: str, user_id: str) -> SessionToken:
-    """Write a new session to the DB and return a SessionToken object."""
-    now        = datetime.now(timezone.utc)
-    expires_at = now + timedelta(hours=SESSION_TTL_HOURS)
-
-    # Load user details for the SessionToken object
-    with _get_conn() as conn:
-        conn.execute(
-            "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (token, user_id, now.isoformat(), expires_at.isoformat()),
+        # Fallback: PBKDF2 with SHA-256
+        salt = secrets.token_hex(16)
+        dk = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            100000,
         )
-        conn.commit()
-
-        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-
-    user = _row_to_user(row)
-    return SessionToken(
-        token=token,
-        user_id=user_id,
-        username=user.username,
-        role=user.role,
-        created_at=now,
-        expires_at=expires_at,
-    )
+        return f"pbkdf2${salt}${dk.hex()}"
 
 
-def _load_session(token: str) -> Optional[SessionToken]:
-    """Load and return a SessionToken from the DB, or None if not found/expired."""
-    with _get_conn() as conn:
-        row = conn.execute(
-            "SELECT s.*, u.username, u.role FROM sessions s "
-            "JOIN users u ON s.user_id = u.user_id "
-            "WHERE s.token = ?",
-            (token,),
-        ).fetchone()
-
-    if row is None:
-        return None
-
-    d          = dict(row)
-    expires_at = datetime.fromisoformat(d["expires_at"])
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-
-    session = SessionToken(
-        token=d["token"],
-        user_id=d["user_id"],
-        username=d["username"],
-        role=d["role"],
-        created_at=datetime.fromisoformat(d["created_at"]).replace(tzinfo=timezone.utc),
-        expires_at=expires_at,
-    )
-
-    if session.is_expired:
-        logger.debug("Session %s is expired — removing", token[:12])
-        _delete_session(token)
-        return None
-
-    return session
-
-
-def _delete_session(token: str) -> None:
-    with _get_conn() as conn:
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-        conn.commit()
-
-
-def _purge_expired_sessions() -> int:
-    """Delete all expired sessions. Returns count deleted."""
-    now = datetime.now(timezone.utc).isoformat()
-    with _get_conn() as conn:
-        cursor = conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
-        conn.commit()
-        return cursor.rowcount
+def _verify_password(password: str, hashed: str) -> bool:
+    """
+    Verify password against stored hash.
+    Supports both bcrypt and PBKDF2 formats.
+    """
+    try:
+        if hashed.startswith("pbkdf2$"):
+            # PBKDF2 format
+            _, salt, stored_dk = hashed.split("$")
+            dk = hashlib.pbkdf2_hmac(
+                "sha256",
+                password.encode("utf-8"),
+                salt.encode("utf-8"),
+                100000,
+            )
+            return secrets.compare_digest(dk.hex(), stored_dk)
+        elif BCRYPT_AVAILABLE:
+            return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+        else:
+            logger.error("Cannot verify bcrypt hash — bcrypt not installed")
+            return False
+    except Exception as exc:
+        logger.error("Password verification error: %s", exc)
+        return False
 
 
 # ─────────────────────────────────────────────
-# Public API
+# Database connection
 # ─────────────────────────────────────────────
 
-def register_user(
-    username:        str,
-    password:        str,
-    role:            str,
-    email:           str,
-    skip_validation: bool = False,
+def _get_connection() -> sqlite3.Connection:
+    """Get database connection with row factory."""
+    ensure_dir(os.path.dirname(AUTH_DB_PATH))
+    conn = sqlite3.connect(AUTH_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+# ─────────────────────────────────────────────
+# Schema initialization
+# ─────────────────────────────────────────────
+
+def init_auth_db() -> None:
+    """
+    Create auth database tables if they don't exist.
+    Call this once at app startup.
+    """
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+
+        # Users table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username        TEXT PRIMARY KEY,
+                password_hash   TEXT NOT NULL,
+                role            TEXT NOT NULL,
+                full_name       TEXT,
+                email           TEXT,
+                failed_attempts INTEGER DEFAULT 0,
+                locked_until    TEXT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                last_login      TEXT
+            )
+        """)
+
+        # Sessions table (persistent sessions)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token       TEXT PRIMARY KEY,
+                username    TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                expires_at  TEXT NOT NULL,
+                is_active   INTEGER DEFAULT 1,
+                FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+            )
+        """)
+
+        # Indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(username)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(is_active)")
+
+        conn.commit()
+        conn.close()
+        logger.info("Auth database initialized at %s", AUTH_DB_PATH)
+
+
+# ─────────────────────────────────────────────
+# User operations
+# ─────────────────────────────────────────────
+
+def create_user(
+    username:   str,
+    password:   str,
+    role:       str,
+    full_name:  Optional[str] = None,
+    email:      Optional[str] = None,
 ) -> bool:
     """
-    Register a new user account.
+    Create a new user account.
 
-    Parameters
-    ----------
-    username        : str — unique login name
-    password        : str — plain-text (hashed immediately, never stored)
-    role            : str — "doctor" | "nurse"
-    email           : str — unique email address
-    skip_validation : bool — bypass validators (only for seed data)
-
-    Returns
-    -------
-    True on success.
-
-    Raises
-    ------
-    ValueError  — if validation fails or username/email already exists
+    Returns True on success, False on validation failure or duplicate.
     """
-    init_auth_db()
-
     # Validate inputs
-    if not skip_validation:
-        ok, err = validate_username(username)
-        if not ok:
-            raise ValueError(f"Invalid username: {err}")
+    ok, err = validate_username(username)
+    if not ok:
+        logger.warning("create_user: invalid username — %s", err)
+        return False
 
-        ok, err = validate_password(password)
-        if not ok:
-            raise ValueError(f"Invalid password: {err}")
+    ok, err = validate_password(password)
+    if not ok:
+        logger.warning("create_user: invalid password — %s", err)
+        return False
 
-        ok, err = validate_email(email)
-        if not ok:
-            raise ValueError(f"Invalid email: {err}")
+    ok, err = validate_role(role)
+    if not ok:
+        logger.warning("create_user: invalid role — %s", err)
+        return False
 
-    if role not in ROLES:
-        raise ValueError(f"Role must be one of {ROLES}, got '{role}'")
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
 
-    # Check uniqueness
-    with _get_conn() as conn:
-        existing_user  = conn.execute(
-            "SELECT user_id FROM users WHERE username = ?", (username,)
-        ).fetchone()
-        existing_email = conn.execute(
-            "SELECT user_id FROM users WHERE email = ?", (email,)
-        ).fetchone()
+        # Check duplicate
+        cursor.execute("SELECT 1 FROM users WHERE username = ?", (username,))
+        if cursor.fetchone():
+            logger.warning("create_user: username already exists — %s", username)
+            conn.close()
+            return False
 
-    if existing_user:
-        raise ValueError(f"Username '{username}' is already taken")
-    if existing_email:
-        raise ValueError(f"Email '{email}' is already registered")
+        now = now_str()
+        password_hash = _hash_password(password)
+        role = role.lower()
 
-    # Hash and store
-    user_id       = str(uuid.uuid4())
-    password_hash = _hash_password(password)
-    now           = _now_iso()
-
-    with _get_conn() as conn:
-        conn.execute(
-            """INSERT INTO users
-               (user_id, username, email, password_hash, role, created_at, last_login, is_active)
-               VALUES (?, ?, ?, ?, ?, ?, '', 1)""",
-            (user_id, username.lower(), email.lower(), password_hash, role, now),
-        )
-        conn.commit()
-
-    logger.info("User registered: %s (%s)", username, role)
-    return True
+        try:
+            cursor.execute("""
+                INSERT INTO users
+                (username, password_hash, role, full_name, email, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (username, password_hash, role, full_name, email, now, now))
+            conn.commit()
+            logger.info("Created user '%s' with role '%s'", username, role)
+            return True
+        except Exception as exc:
+            logger.error("create_user failed: %s", exc)
+            return False
+        finally:
+            conn.close()
 
 
-def login(username: str, password: str) -> Optional[SessionToken]:
+def get_user(username: str) -> Optional[Dict[str, Any]]:
     """
-    Authenticate a user and create a session.
-
-    Parameters
-    ----------
-    username : str
-    password : str — plain-text password
-
-    Returns
-    -------
-    SessionToken if credentials are valid and account is active.
-    None if authentication fails.
+    Retrieve user by username.
+    Returns None if not found.
     """
-    init_auth_db()
-
-    # Constant-time lookup (prevent username enumeration via timing)
-    with _get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM users WHERE username = ? COLLATE NOCASE",
-            (username.strip(),),
-        ).fetchone()
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+    row = cursor.fetchone()
+    conn.close()
 
     if row is None:
-        # Still hash something to prevent timing attacks
-        _verify_password(password, _hash_password("dummy_constant_time"))
-        logger.warning("Login failed: unknown username '%s'", username)
         return None
 
-    user = _row_to_user(row)
-    stored_hash = dict(row)["password_hash"]
+    return dict(row)
 
-    if not _verify_password(password, stored_hash):
-        logger.warning("Login failed: wrong password for '%s'", username)
+
+def update_user_role(username: str, new_role: str) -> bool:
+    """
+    Update a user's role.
+    """
+    ok, err = validate_role(new_role)
+    if not ok:
+        logger.warning("update_user_role: %s", err)
+        return False
+
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        now = now_str()
+        cursor.execute("""
+            UPDATE users SET role = ?, updated_at = ?
+            WHERE username = ?
+        """, (new_role.lower(), now, username))
+        conn.commit()
+        success = cursor.rowcount > 0
+        conn.close()
+        if success:
+            logger.info("Updated user '%s' role to '%s'", username, new_role)
+        return success
+
+
+def delete_user(username: str) -> bool:
+    """
+    Delete a user account.
+    """
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM users WHERE username = ?", (username,))
+        conn.commit()
+        success = cursor.rowcount > 0
+        conn.close()
+        if success:
+            logger.info("Deleted user '%s'", username)
+        return success
+
+
+def list_users() -> List[Dict[str, Any]]:
+    """
+    List all users (excluding password hash).
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT username, role, full_name, email, failed_attempts,
+               locked_until, created_at, last_login
+        FROM users
+        ORDER BY created_at DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+# ─────────────────────────────────────────────
+# Authentication
+# ─────────────────────────────────────────────
+
+def _is_locked(locked_until: Optional[str]) -> bool:
+    """Check if account is currently locked."""
+    if not locked_until:
+        return False
+    try:
+        lock_time = datetime.fromisoformat(locked_until)
+        return datetime.now() < lock_time
+    except ValueError:
+        return False
+
+
+def _update_failed_attempts(username: str) -> None:
+    """Increment failed attempts and lock account if threshold exceeded."""
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        now = now_str()
+
+        cursor.execute("""
+            UPDATE users
+            SET failed_attempts = failed_attempts + 1,
+                updated_at = ?
+            WHERE username = ?
+        """, (now, username))
+
+        # Check if we need to lock
+        cursor.execute(
+            "SELECT failed_attempts FROM users WHERE username = ?",
+            (username,),
+        )
+        row = cursor.fetchone()
+        if row and row["failed_attempts"] >= MAX_LOGIN_ATTEMPTS:
+            lock_until = (
+                datetime.now() + timedelta(minutes=LOCKOUT_DURATION_MIN)
+            ).isoformat()
+            cursor.execute("""
+                UPDATE users SET locked_until = ? WHERE username = ?
+            """, (lock_until, username))
+            logger.warning(
+                "Account '%s' locked until %s after %d failed attempts",
+                username, lock_until, row["failed_attempts"],
+            )
+
+        conn.commit()
+        conn.close()
+
+
+def _reset_failed_attempts(username: str) -> None:
+    """Reset failed attempts on successful login."""
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        now = now_str()
+        cursor.execute("""
+            UPDATE users
+            SET failed_attempts = 0, locked_until = NULL, last_login = ?, updated_at = ?
+            WHERE username = ?
+        """, (now, now, username))
+        conn.commit()
+        conn.close()
+
+
+def authenticate(username: str, password: str) -> Optional[Dict[str, Any]]:
+    """
+    Authenticate user credentials.
+
+    Returns
+    -------
+    user dict on success, None on failure.
+    Implements account lockout policy.
+    """
+    # Validate inputs
+    ok, err = validate_username(username)
+    if not ok:
+        logger.warning("authenticate: invalid username format")
         return None
 
-    if not user.is_active:
-        logger.warning("Login denied: account '%s' is inactive", username)
+    if not password:
+        logger.warning("authenticate: empty password")
         return None
 
-    # Create session
-    token   = _generate_token()
-    session = _store_session(token, user.user_id)
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+    row = cursor.fetchone()
+    conn.close()
 
-    # Update last_login timestamp
-    with _get_conn() as conn:
-        conn.execute(
-            "UPDATE users SET last_login = ? WHERE user_id = ?",
-            (_now_iso(), user.user_id),
+    if row is None:
+        logger.warning("authenticate: user not found — %s", username)
+        return None
+
+    user = dict(row)
+
+    # Check lockout
+    if _is_locked(user.get("locked_until")):
+        logger.warning("authenticate: account locked — %s", username)
+        return None
+
+    # Check max attempts before verifying password
+    ok, err = validate_login_attempt(user.get("failed_attempts", 0))
+    if not ok:
+        logger.warning("authenticate: max attempts exceeded — %s", username)
+        return None
+
+    # Verify password
+    if not _verify_password(password, user["password_hash"]):
+        logger.warning("authenticate: invalid password — %s", username)
+        _update_failed_attempts(username)
+        return None
+
+    # Success
+    _reset_failed_attempts(username)
+    logger.info("authenticate: success — %s", username)
+
+    # Remove sensitive fields
+    user.pop("password_hash", None)
+    return user
+
+
+# ─────────────────────────────────────────────
+# Session management
+# ─────────────────────────────────────────────
+
+def create_session(user: Dict[str, Any]) -> str:
+    """
+    Create a new session for an authenticated user.
+    Returns session token.
+    """
+    token = secrets.token_urlsafe(32)
+    now = datetime.now()
+    expires = now + timedelta(hours=SESSION_TTL_HOURS)
+
+    session_data = {
+        "token":      token,
+        "username":   user["username"],
+        "role":       user["role"],
+        "full_name":  user.get("full_name", user["username"]),
+        "created_at": now.isoformat(),
+        "expires_at": expires.isoformat(),
+    }
+
+    # Store in memory
+    with _sessions_lock:
+        _sessions[token] = session_data
+
+    # Store in database (persistent)
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO sessions (token, username, created_at, expires_at)
+            VALUES (?, ?, ?, ?)
+        """, (token, user["username"], session_data["created_at"], session_data["expires_at"]))
+        conn.commit()
+        conn.close()
+
+    logger.info(
+        "Created session for '%s' — expires in %d hours",
+        user["username"], SESSION_TTL_HOURS,
+    )
+    return token
+
+
+def validate_session(token: str) -> Optional[Dict[str, Any]]:
+    """
+    Validate a session token.
+    Returns session data if valid, None otherwise.
+    """
+    if not token:
+        return None
+
+    # Check memory first
+    with _sessions_lock:
+        session = _sessions.get(token)
+        if session:
+            expires = datetime.fromisoformat(session["expires_at"])
+            if datetime.now() < expires:
+                return session
+            else:
+                # Expired — remove from memory
+                del _sessions[token]
+
+    # Check database
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT s.*, u.role, u.full_name
+        FROM sessions s
+        JOIN users u ON s.username = u.username
+        WHERE s.token = ? AND s.is_active = 1
+    """, (token,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if row is None:
+        return None
+
+    session = dict(row)
+    expires = datetime.fromisoformat(session["expires_at"])
+    if datetime.now() >= expires:
+        # Expired — deactivate
+        with _db_lock:
+            conn = _get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE sessions SET is_active = 0 WHERE token = ?",
+                (token,),
+            )
+            conn.commit()
+            conn.close()
+        return None
+
+    # Cache in memory
+    with _sessions_lock:
+        _sessions[token] = {
+            "token":      token,
+            "username":   session["username"],
+            "role":       session["role"],
+            "full_name":  session["full_name"],
+            "created_at": session["created_at"],
+            "expires_at": session["expires_at"],
+        }
+
+    return _sessions[token]
+
+
+def clear_session(token: str) -> None:
+    """
+    Invalidate a session token.
+    """
+    with _sessions_lock:
+        _sessions.pop(token, None)
+
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE sessions SET is_active = 0 WHERE token = ?",
+            (token,),
         )
         conn.commit()
+        conn.close()
 
-    # Clean up old expired sessions periodically
-    _purge_expired_sessions()
+    logger.info("Cleared session token=%s", mask_key(token, visible=4))
 
-    logger.info("Login successful: %s (%s)", username, user.role)
-    return session
+
+def cleanup_expired_sessions() -> int:
+    """
+    Remove expired sessions from database.
+    Returns count of cleaned sessions.
+    """
+    now = now_str()
+    with _db_lock:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM sessions WHERE expires_at < ? OR is_active = 0",
+            (now,),
+        )
+        count = cursor.rowcount
+        conn.commit()
+        conn.close()
+
+    # Clean memory
+    with _sessions_lock:
+        expired = [
+            t for t, s in _sessions.items()
+            if datetime.fromisoformat(s["expires_at"]) < datetime.now()
+        ]
+        for t in expired:
+            del _sessions[t]
+
+    if count > 0:
+        logger.info("Cleaned up %d expired sessions", count)
+    return count
+
+
+# ─────────────────────────────────────────────
+# Permission checks
+# ─────────────────────────────────────────────
+
+def check_permission(role: str, permission: str) -> bool:
+    """
+    Check if a role has a specific permission.
+    Wrapper around ROLE_PERMISSIONS from constants.
+    """
+    if not role or not permission:
+        return False
+    perms = ROLE_PERMISSIONS.get(role.lower(), [])
+    return permission in perms
+
+
+def user_has_permission(user: Optional[Dict[str, Any]], permission: str) -> bool:
+    """
+    Check if a user object has a specific permission.
+    """
+    if not user:
+        return False
+    role = user.get("role", "")
+    return check_permission(role, permission)
+
+
+# ─────────────────────────────────────────────
+# Default admin creation
+# ─────────────────────────────────────────────
+
+def create_default_admin() -> bool:
+    """
+    Create a default admin user if no users exist.
+    Uses environment variables or secure defaults.
+    """
+    conn = _get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) as cnt FROM users")
+    row = cursor.fetchone()
+    conn.close()
+
+    if row and row["cnt"] > 0:
+        return False  # Users already exist
+
+    # Get credentials from env or use defaults
+    admin_user = os.getenv("ADMIN_USERNAME", "admin")
+    admin_pass = os.getenv("ADMIN_PASSWORD", "")
+
+    if not admin_pass:
+        # Generate secure random password
+        admin_pass = secrets.token_urlsafe(16)
+        logger.warning(
+            "ADMIN_PASSWORD not set — generated secure password: %s",
+            admin_pass,
+        )
+        logger.warning("⚠️  Save this password securely! It will not be shown again.")
+
+    success = create_user(
+        username=admin_user,
+        password=admin_pass,
+        role=ROLE_ADMIN,
+        full_name="System Administrator",
+    )
+
+    if success:
+        logger.info("Default admin user created: %s", admin_user)
+    else:
+        logger.error("Failed to create default admin user")
+
+    return success
+
+
+# ─────────────────────────────────────────────
+# Streamlit integration helpers
+# ─────────────────────────────────────────────
+
+def login(username: str, password: str) -> Optional[str]:
+    """
+    Convenience function for Streamlit login flow.
+    Returns session token on success, None on failure.
+    """
+    user = authenticate(username, password)
+    if user:
+        return create_session(user)
+    return None
 
 
 def logout(token: str) -> None:
     """
-    Invalidate a session token.
-
-    Parameters
-    ----------
-    token : str — the session token to revoke
+    Convenience function for Streamlit logout flow.
     """
-    _delete_session(token)
-    logger.info("Session revoked: %s...", token[:12])
+    clear_session(token)
 
 
-def get_current_user(token: str) -> Optional[UserRecord]:
+def get_session_user(token: str) -> Optional[Dict[str, Any]]:
     """
-    Return the UserRecord for a valid session token.
-
-    Parameters
-    ----------
-    token : str
-
-    Returns
-    -------
-    UserRecord if token is valid and not expired, None otherwise.
+    Get user data from session token.
+    Returns None if session is invalid.
     """
-    session = _load_session(token)
-    if session is None:
-        return None
-
-    with _get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM users WHERE user_id = ? AND is_active = 1",
-            (session.user_id,),
-        ).fetchone()
-
-    if row is None:
-        return None
-    return _row_to_user(row)
-
-
-def is_authenticated(token: str) -> bool:
-    """Return True if the token is valid and not expired."""
-    return _load_session(token) is not None
-
-
-def get_session(token: str) -> Optional[SessionToken]:
-    """Return the full SessionToken object for a token string."""
-    return _load_session(token)
-
-
-def has_permission(token: str, permission: str) -> bool:
-    """
-    Check whether the current user has a specific permission.
-
-    Parameters
-    ----------
-    token      : str — active session token
-    permission : str — permission name (from ROLE_PERMISSIONS in constants)
-
-    Returns
-    -------
-    True if the user's role grants this permission.
-
-    Example
-    -------
-    if has_permission(token, "run_ai_diagnosis"):
-        run_diagnosis()
-    """
-    session = _load_session(token)
-    if session is None:
-        return False
-
-    role_perms = ROLE_PERMISSIONS.get(session.role, {})
-    return bool(role_perms.get(permission, False))
-
-
-def require_permission(token: str, permission: str) -> None:
-    """
-    Raise PermissionError if the user does NOT have the given permission.
-
-    Use as a guard at the top of restricted functions.
-
-    Parameters
-    ----------
-    token      : str
-    permission : str
-
-    Raises
-    ------
-    PermissionError  — with a descriptive message
-    ValueError       — if token is invalid/expired
-    """
-    session = _load_session(token)
-
-    if session is None:
-        raise ValueError("Session expired or invalid. Please log in again.")
-
-    if not has_permission(token, permission):
-        logger.warning(
-            "Permission denied: user=%s role=%s permission=%s",
-            session.username, session.role, permission,
-        )
-        raise PermissionError(
-            f"Your role '{session.role}' does not have '{permission}' access. "
-            "Please contact your administrator."
-        )
-
-
-def get_all_users() -> List[UserRecord]:
-    """
-    Return all registered users (for admin panel).
-
-    Returns
-    -------
-    List[UserRecord] sorted by created_at ascending.
-    """
-    init_auth_db()
-    with _get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM users ORDER BY created_at ASC"
-        ).fetchall()
-    return [_row_to_user(r) for r in rows]
-
-
-def change_password(
-    token:    str,
-    old_pw:   str,
-    new_pw:   str,
-) -> bool:
-    """
-    Change the password for the currently logged-in user.
-
-    Parameters
-    ----------
-    token  : str — active session token
-    old_pw : str — current password (for verification)
-    new_pw : str — new password
-
-    Returns
-    -------
-    True on success, False if old_pw is wrong.
-
-    Raises
-    ------
-    ValueError   — if new password fails validation
-    ValueError   — if token is invalid
-    """
-    session = _load_session(token)
-    if session is None:
-        raise ValueError("Session invalid or expired")
-
-    # Verify old password
-    with _get_conn() as conn:
-        row = conn.execute(
-            "SELECT password_hash FROM users WHERE user_id = ?",
-            (session.user_id,),
-        ).fetchone()
-
-    if row is None or not _verify_password(old_pw, dict(row)["password_hash"]):
-        return False
-
-    # Validate new password
-    ok, err = validate_password(new_pw)
-    if not ok:
-        raise ValueError(f"New password invalid: {err}")
-
-    new_hash = _hash_password(new_pw)
-    with _get_conn() as conn:
-        conn.execute(
-            "UPDATE users SET password_hash = ? WHERE user_id = ?",
-            (new_hash, session.user_id),
-        )
-        conn.commit()
-
-    logger.info("Password changed for user: %s", session.username)
-    return True
-
-
-def deactivate_user(admin_token: str, username: str) -> bool:
-    """
-    Deactivate (soft-delete) a user account.
-    Requires the caller to have 'manage_users' permission.
-
-    Parameters
-    ----------
-    admin_token : str — must belong to a doctor with manage_users permission
-    username    : str — account to deactivate
-
-    Returns
-    -------
-    True on success.
-    """
-    require_permission(admin_token, "manage_users")
-
-    with _get_conn() as conn:
-        cursor = conn.execute(
-            "UPDATE users SET is_active = 0 WHERE username = ? COLLATE NOCASE",
-            (username,),
-        )
-        conn.commit()
-        changed = cursor.rowcount > 0
-
-    if changed:
-        logger.info("User deactivated: %s", username)
-    return changed
-
-
-def get_user_permissions(token: str) -> Dict[str, bool]:
-    """
-    Return the full permissions dict for the current user's role.
-
-    Returns
-    -------
-    dict mapping permission_name → True/False
-
-    Example return:
-    {
-        "view_patient_data": True,
-        "run_ai_diagnosis":  False,   # nurse
-        "export_data":       False,   # nurse
-        ...
-    }
-    """
-    session = _load_session(token)
-    if session is None:
-        return {}
-    return dict(ROLE_PERMISSIONS.get(session.role, {}))
+    session = validate_session(token)
+    if session:
+        return {
+            "username":  session["username"],
+            "role":      session["role"],
+            "full_name": session["full_name"],
+        }
+    return None
 
 
 # ─────────────────────────────────────────────
 # Module init
 # ─────────────────────────────────────────────
+
 try:
     init_auth_db()
+    create_default_admin()
 except Exception as _exc:
-    logger.warning("Auth DB could not be initialised on import: %s", _exc)
+    logger.error("Auth service initialization failed: %s", _exc)

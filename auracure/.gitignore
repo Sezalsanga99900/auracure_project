@@ -1,3 +1,6 @@
+### 📄 Corrected `.gitignore`
+
+```gitignore
 # ══════════════════════════════════════════════════════════════════
 # AuraEcho+ — .gitignore
 # ══════════════════════════════════════════════════════════════════
@@ -7,13 +10,18 @@
 .env.local
 .env.production
 .env.staging
+
+# Firebase credentials
+database/firebase_credentials.json
 data/firebase_credentials.json
 *_credentials.json
 *_service_account.json
+
+# Certificates & Keys
 *.pem
 *.key
 
-# ── Python ────────────────────────────────────────────────────────
+# ── Python ───────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
@@ -50,17 +58,21 @@ htmlcov/
 database/*.db
 database/*.sqlite
 database/*.sqlite3
+database/records_backup.csv
 
 # ── ML Models & Scalers (regenerated from data) ──────────────────
-data/models/*.pkl
-data/models/*.joblib
-data/models/*.h5
+# FIXED: Path changed from data/models/ to models/
+models/
+models/*.pkl
+models/*.joblib
+models/*.h5
 
 # ── Export files ─────────────────────────────────────────────────
 data/exports/
 *.csv.export
 
 # ── Streamlit ────────────────────────────────────────────────────
+.streamlit/
 .streamlit/secrets.toml
 
 # ── IDE & Editor ─────────────────────────────────────────────────
@@ -75,6 +87,7 @@ Thumbs.db
 # ── Logs ─────────────────────────────────────────────────────────
 logs/
 *.log
+auraecho.log
 
 # ── Jupyter ──────────────────────────────────────────────────────
 .ipynb_checkpoints/
@@ -86,3 +99,19 @@ logs/
 .LSOverride
 Desktop.ini
 $RECYCLE.BIN/
+```
+
+### ✅ Summary of Changes
+
+| Change | Type | Reason |
+|--------|------|--------|
+| `data/models/` → `models/` | 🔧 Fixed | Matches `MODEL_SAVE_PATH` in `constants.py` |
+| Added `database/firebase_credentials.json` | ➕ Added | Matches expected credentials path |
+| Added `auraecho.log` | ➕ Added | Matches `LOG_FILE` in `constants.py` |
+| Added `database/records_backup.csv` | ➕ Added | Matches `LOCAL_CSV_BACKUP_PATH` |
+| Added `.streamlit/` | ➕ Added | Ignores entire Streamlit config directory |
+| Removed `data/models/` | 🔴 Removed | No longer used |
+
+This `.gitignore` is now **fully aligned** with your codebase and will prevent accidental commits of sensitive data, logs, and generated files. 🚀
+
+**🎉 Your AuraEcho+ project is now complete with all configuration files properly set up!** ❤️
