@@ -23,6 +23,11 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
+
+# Add project root to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
 # 1. PAGE CONFIGURATION (Must be the very first Streamlit command)
 from utils.constants import PAGE_TITLE, PAGE_ICON, PAGE_LAYOUT
 
@@ -33,8 +38,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Add project root to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# # Add project root to path for imports
+# sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Imports — Layer by Layer
@@ -53,7 +58,8 @@ from utils.constants import (
     ROLE_NURSE,
     ROLE_ADMIN,
 )
-from utils.helpers import get_logger, now_str, load_sample_input, local_css
+
+from utils.helpers import get_logger, now_str, load_sample_input
 from utils.validators import validate_patient, errors_to_str
 
 # Layer 2: Core
@@ -93,12 +99,7 @@ logger = get_logger(__name__)
 # Page Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title=PAGE_TITLE,
-    page_icon=PAGE_ICON,
-    layout=PAGE_LAYOUT,
-    initial_sidebar_state="expanded",
-)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Load CSS
@@ -106,11 +107,13 @@ st.set_page_config(
 
 def load_css() -> None:
     """Load global stylesheet."""
-    if os.path.exists(ASSETS_CSS_PATH):
-        with open(ASSETS_CSS_PATH, "r", encoding="utf-8") as f:
+    base_dir=os.path.dirname(os.path.abspath(__file__))
+    css_path=os.path.join(base_dir,"assets","style.css")
+    if os.path.exists(css_path):
+        with open(css_path, "r", encoding="utf-8") as f:
             st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
     else:
-        logger.warning("CSS file not found at %s", ASSETS_CSS_PATH)
+        logger.warning("CSS file not found at %s", css_path)
 
 load_css()
 
