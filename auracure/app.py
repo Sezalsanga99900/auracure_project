@@ -15,10 +15,23 @@
 #     streamlit run app.py
 # =============================================================================
 
+
+
+
 import streamlit as st
 import os
 import sys
 from typing import Any, Dict, Optional
+
+# 1. PAGE CONFIGURATION (Must be the very first Streamlit command)
+from utils.constants import PAGE_TITLE, PAGE_ICON, PAGE_LAYOUT
+
+st.set_page_config(
+    page_title=PAGE_TITLE,
+    page_icon=PAGE_ICON,
+    layout=PAGE_LAYOUT,
+    initial_sidebar_state="expanded",
+)
 
 # Add project root to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -40,7 +53,7 @@ from utils.constants import (
     ROLE_NURSE,
     ROLE_ADMIN,
 )
-from utils.helpers import get_logger, now_str, load_sample_input
+from utils.helpers import get_logger, now_str, load_sample_input, local_css
 from utils.validators import validate_patient, errors_to_str
 
 # Layer 2: Core

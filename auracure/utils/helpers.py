@@ -602,3 +602,16 @@ def check_dependencies() -> Tuple[bool, List[str]]:
         except ImportError:
             missing.append(display_name)
     return len(missing) == 0, missing
+
+import streamlit as st
+import os
+
+def local_css(file_name):
+    """
+    Reads a local CSS file and injects it into the Streamlit app.
+    """
+    if os.path.exists(file_name):
+        with open(file_name) as f:
+            st.markdown(f'<style>{f.read()}</style>', unsafe_allow_html=True)
+    else:
+        st.error(f"CSS file not found at {file_name}")
