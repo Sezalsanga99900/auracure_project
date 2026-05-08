@@ -652,8 +652,8 @@ def create_default_admin() -> bool:
 
     # Get credentials from env or use defaults
     admin_user = os.getenv("ADMIN_USERNAME", "admin")
-    admin_pass = os.getenv("ADMIN_PASSWORD", "admin123")
-    # admin_pass = os.getenv("ADMIN_PASSWORD", "admin")
+    # admin_pass = os.getenv("ADMIN_PASSWORD", "")
+    admin_pass = os.getenv("ADMIN_PASSWORD", "admin")
 
     if not admin_pass:
         # Generate secure random password
