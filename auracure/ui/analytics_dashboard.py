@@ -47,7 +47,6 @@ WHY THIS FILE EXISTS (explain to judges):
     This dashboard answers ALL of those questions in one screen.
 ─────────────────────────────────────────────────────────────────
 """
-
 import warnings
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -62,7 +61,7 @@ import streamlit as st
 warnings.filterwarnings("ignore")
 
 # ── Internal imports ──────────────────────────────────────────────────────────
-from utils.constants import (
+from auracure.utils.constants import (
     RISK_LOW,
     RISK_MEDIUM,
     RISK_HIGH,
