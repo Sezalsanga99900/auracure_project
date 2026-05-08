@@ -9,7 +9,7 @@
 streamlit>=1.35.0,<2.0.0          # UI framework — core dependency
 
 # ── Data Science & ML ──────────────────────────────────────────
-numpy>=1.26.0,<2.0.0              # numerical arrays
+numpy>=2.1.0,            # numerical arrays
 pandas>=2.1.0,<3.0.0              # dataframes + CSV handling
 scikit-learn>=1.4.0,<2.0.0        # RandomForest, KNN, MinMaxScaler
 
@@ -17,11 +17,12 @@ scikit-learn>=1.4.0,<2.0.0        # RandomForest, KNN, MinMaxScaler
 plotly>=5.18.0,<6.0.0             # interactive charts for dashboard
 
 # ── AI — Online Backends ───────────────────────────────────────
-groq>=0.9.0                       # Groq API (ultra-fast Llama3)
+groq>=0.9.0                       # Groq API (ultra-fast Llama3)pytho
 openai>=1.30.0                    # OpenAI GPT-4o fallback
 
 # ── AI — Offline (Ollama talks over HTTP — no Python SDK needed)
 requests>=2.31.0                  # HTTP client for Ollama API calls
+ollama==0.2.1                     #local LLM client
 
 # ── Database ───────────────────────────────────────────────────
 # sqlite3 is in Python stdlib — no install needed
